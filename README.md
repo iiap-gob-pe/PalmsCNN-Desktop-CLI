@@ -1,4 +1,4 @@
-# Sistema de Segmentación de Palmeras (Amazonía Peruana) 🚀
+# PalmsCNN-Desktop-CLI 🚀
 
 ![Estado del Proyecto](https://img.shields.io/badge/Estado-Finalizado-green)
 ![Lenguaje](https://img.shields.io/badge/Lenguaje-Python_3.11-blue)
