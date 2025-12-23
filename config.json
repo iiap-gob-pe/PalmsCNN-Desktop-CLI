@@ -1,0 +1,71 @@
+{
+    "scripts": {
+        "segmentacion": "scripts/segmentacion.py",
+        "instancias": "scripts/instancias.py",
+        "segmentacion_tiles": "scripts/process_with_tiles.py",
+        "instancias_tiles": "scripts/instancias_tiles.py"
+    },
+    "parameters": {
+        "segmentacion": {
+            "window_radius": 256,
+            "internal_window_radius": 192,
+            "scaling": "normalize"
+        },
+        "instancias": {
+            "window_radius": 350,
+            "internal_window_radius": 262,
+            "scaling": "none"
+        },
+        "segmentacion_tiles": {
+            "tile_size": 512,
+            "overlap": 64,
+            "scaling": "normalize",
+            "max_batch_size": 4,
+            "min_batch_size": 1,
+            "memory_safety_margin": 0.2
+        },
+        "instancias_tiles": {
+            "window_radius": 350,
+            "target_memory_mb": 4096
+        }
+    },
+    "output": {
+        "directory": "output",
+        "save_images": true,
+        "save_logs": true,
+        "keep_temp_files": false
+    },
+    "optimization": {
+        "memory_management": {
+            "low_ram_mode": false,
+            "optimized_mode": true,
+            "max_preview_size": 2000,
+            "tile_size": 512,
+            "enable_memory_monitoring": true,
+            "safety_margin": 0.7,
+            "min_tile_size": 256,
+            "max_tile_size": 1024
+        },
+        "performance": {
+            "enable_downsampling": true,
+            "downsampling_factor": 4,
+            "tile_overlap": 32,
+            "max_batch_size": 1,
+            "cleanup_after_tile": true
+        }
+    },
+    "models": {
+        "segmentacion": "models/deeplab_keras_model_palms_iaa_all_0.003_W.onnx",
+        "instancias": "models/model_converted.onnx"
+    },
+    "tile_processing": {
+        "enabled": true,
+        "default_tile_size": 512,
+        "overlap": 32,
+        "batch_size": 1,
+        "model_overhead_mb": 200,
+        "min_tile_size": 256,
+        "max_tile_size": 1024,
+        "cleanup_temp_files": true
+    }
+}
