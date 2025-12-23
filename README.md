@@ -48,7 +48,7 @@ El sistema utiliza una arquitectura de segmentación (DeepLabV3+) optimizada:
 
 1.  **Clonar el repositorio:**
     ```bash
-    git clone [https://github.com/TU-USUARIO/Sistema-Segmentacion-Palmeras.git](https://github.com/TU-USUARIO/Sistema-Segmentacion-Palmeras.git)
+    git clone [https://github.com/iiap-gob-pe/PalmsCNN-Desktop-CLI.git](https://github.com/iiap-gob-pe/PalmsCNN-Desktop-CLI.git)
     ```
 
 2.  **Instalar dependencias:**
