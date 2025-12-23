@@ -41,7 +41,7 @@ El sistema utiliza una arquitectura de segmentación (DeepLabV3+) optimizada:
 
 ## 📸 Capturas de Pantalla / Demo
 
-![Interfaz Principal](gui_preview.png)
+![Interfaz Principal](gui.preview.png)
 *Vista de la aplicación procesando un ortomosaico con visualización de máscaras en tiempo real.*
 
 ## 🚀 Instalación y Uso
