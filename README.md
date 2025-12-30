@@ -59,4 +59,7 @@ Organización modular siguiendo buenas prácticas de ingeniería de software:
 ├── installers/        # Binarios pre-compilados críticos (GDAL .whl)
 ├── output/            # Carpeta de generación de resultados
 ├── run.py             # Punto de entrada de la aplicación
-└── Instalacion.ipynb  # Manual técnico detallado
+└── Manual_instalacion.ipynb  # Manual de Instalacion del proyecto
+└── config.json        # Ajuste de los modelos y uso de ram
+└── requirements.txt   # Librerias para el uso del software
+
