@@ -46,28 +46,7 @@ El sistema utiliza una arquitectura de segmentación (DeepLabV3+) optimizada:
 
 *Vista de la aplicación procesando un ortomosaico con visualización de máscaras en tiempo real.*
 
-## 🚀 Instalación y Uso
 
-1.  **Clonar el repositorio:**
-    ```bash
-    git clone [https://github.com/iiap-gob-pe/PalmsCNN-Desktop-CLI.git](https://github.com/iiap-gob-pe/PalmsCNN-Desktop-CLI.git)
-    ```
-
-2.  **Instalar dependencias:**
-    > **Nota:** Este proyecto requiere GDAL. Se recomienda usar el instalador `.whl` incluido en la carpeta `installers/` antes de ejecutar pip.
-    
-    ```bash
-    # 1. Instalar núcleo GDAL (Windows)
-    pip install installers/GDAL-3.6.4-cp311-cp311-win_amd64.whl
-    
-    # 2. Instalar resto de librerías
-    pip install -r requirements.txt
-    ```
-
-3.  **Ejecutar:**
-    ```bash
-    python run.py
-    ```
 
 ## 📄 Estructura del Proyecto
 
