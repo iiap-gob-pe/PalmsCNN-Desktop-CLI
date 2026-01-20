@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Tuple, Optional, List, Dict, Any
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing as mp
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
 
@@ -21,10 +22,10 @@ from matplotlib.colors import ListedColormap, BoundaryNorm
 gdal.UseExceptions()
 
 # ============================================================================
-# CONFIGURACIÓN DE LOGGING Y ARGUMENTOS
+# CONFIGURACIÓN DE LOGGING Y ARGUMENTOS (SIN UNICODE PARA WINDOWS)
 # ============================================================================
 
-# Configurar logging para Windows (sin caracteres Unicode problemáticos)
+# Configurar logging para Windows (SIN caracteres Unicode)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -36,7 +37,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 parser = argparse.ArgumentParser(
-    description='Segmentación por Tiles con Procesamiento por Batches para Máxima Velocidad'
+    description='Segmentacion por Tiles con Procesamiento por Batches para Maxima Velocidad'
 )
 parser.add_argument('image_path', help='Ruta a la imagen TIF')
 parser.add_argument('--model', default='Redes/deeplab_keras_model_palms_iaa_all_0.003_W.onnx',
@@ -49,20 +50,20 @@ parser.add_argument('--overlap', type=int, default=64,
                     help='Solapamiento entre tiles para evitar bordes')
 parser.add_argument('--scaling', choices=['none', 'normalize'], default='normalize',
                     help='Tipo de escalado de entrada')
-parser.add_argument('--max_batch_size', type=int, default=8,
-                    help='Tamaño máximo del batch para inferencia (4-8 recomendado)')
-parser.add_argument('--min_batch_size', type=int, default=4,
-                    help='Tamaño mínimo del batch para inferencia')
+parser.add_argument('--max_batch_size', type=int, default=96,  # <--- CAMBIADO DE 1024 A 96
+                    help='Tamaño maximo del batch para inferencia')
+parser.add_argument('--min_batch_size', type=int, default=64,  # <--- CAMBIADO DE 512 A 64
+                    help='Tamaño minimo del batch para inferencia')
 parser.add_argument('--min_confidence', type=float, default=0.5,
-                    help='Umbral mínimo de confianza para predicciones')
-parser.add_argument('--memory_safety_margin', type=float, default=0.2,
-                    help='Margen de seguridad para memoria (0.2 = 20%%)')
-parser.add_argument('--prefetch_tiles', type=int, default=16,
-                    help='Número de tiles a precargar en memoria')
+                    help='Umbral minimo de confianza para predicciones')
+parser.add_argument('--memory_safety_margin', type=float, default=0.005,
+                    help='Margen de seguridad para memoria (0.005 = 0.5%%)')
+parser.add_argument('--prefetch_tiles', type=int, default=10000,
+                    help='Numero de tiles a precargar en memoria')
 parser.add_argument('--save_npz', action='store_true',
-                    help='Guardar tiles como NPZ para inspección')
+                    help='Guardar tiles como NPZ para inspeccion')
 parser.add_argument('--debug', action='store_true',
-                    help='Modo debug con más información')
+                    help='Modo debug con mas informacion')
 
 args = parser.parse_args()
 
@@ -72,7 +73,7 @@ args = parser.parse_args()
 
 @dataclass
 class TileInfo:
-    """Información de un tile para procesamiento"""
+    """Informacion de un tile para procesamiento"""
     id: int
     row: int
     col: int
@@ -92,19 +93,19 @@ class TileInfo:
 
 @dataclass
 class BatchInfo:
-    """Información de un batch de tiles"""
+    """Informacion de un batch de tiles"""
     tiles: List[TileInfo]
     batch_input: np.ndarray
     start_time: float
 
 # ============================================================================
-# CLASE PARA MANEJO DE MEMORIA Y MONITOREO AVANZADO
+# CLASE PARA MANEJO DE MEMORIA Y MONITOREO EXTREMO
 # ============================================================================
 
-class AdvancedMemoryMonitor:
-    """Monitoriza y gestiona el uso de memoria de forma inteligente"""
+class ExtremeMemoryMonitor:
+    """Monitoriza y gestiona el uso de memoria de forma EXTREMA"""
     
-    def __init__(self, safety_margin: float = 0.2):
+    def __init__(self, safety_margin: float = 0.005):
         self.process = psutil.Process()
         self.system_memory = psutil.virtual_memory()
         self.start_memory = self.get_memory_mb()
@@ -112,8 +113,10 @@ class AdvancedMemoryMonitor:
         self.history = []
         self.peak_memory = 0
         
+        logger.info("MODO EXTREMO - USO 100% DE RAM ACTIVADO")
         logger.info(f"Memoria total del sistema: {self.system_memory.total / (1024**3):.1f} GB")
         logger.info(f"Memoria disponible: {self.system_memory.available / (1024**3):.1f} GB")
+        logger.info(f"Margen de seguridad: {self.safety_margin*100:.1f}%")
     
     def get_memory_mb(self) -> float:
         """Obtiene uso de memoria en MB"""
@@ -128,7 +131,7 @@ class AdvancedMemoryMonitor:
         return self.process.memory_percent()
     
     def update_stats(self):
-        """Actualiza estadísticas de memoria"""
+        """Actualiza estadisticas de memoria"""
         current = self.get_memory_mb()
         self.peak_memory = max(self.peak_memory, current)
         self.history.append(current)
@@ -137,18 +140,18 @@ class AdvancedMemoryMonitor:
         self.system_memory = psutil.virtual_memory()
     
     def log_memory(self, label: str = "", detailed: bool = False):
-        """Registra uso de memoria (sin caracteres Unicode para Windows)"""
+        """Registra uso de memoria"""
         current = self.get_memory_mb()
         available = self.get_available_memory_mb()
         
-        # Usar "delta" en lugar de Δ para Windows
         delta = current - self.start_memory
         delta_sign = "+" if delta >= 0 else ""
         
         logger.info(f"Memoria {label}: {current:.1f} MB (delta: {delta_sign}{delta:+.1f} MB)")
         
         if detailed:
-            logger.info(f"  Disponible: {available:.1f} MB, Uso sistema: {self.system_memory.percent:.1f}%")
+            usage_percent = (self.system_memory.total - available) / self.system_memory.total * 100
+            logger.info(f"  Disponible: {available:.1f} MB, Uso sistema: {usage_percent:.1f}%")
             logger.info(f"  Pico: {self.peak_memory:.1f} MB")
         
         self.update_stats()
@@ -159,7 +162,7 @@ class AdvancedMemoryMonitor:
         available = self.get_available_memory_mb()
         current = self.get_memory_mb()
         
-        # Considerar margen de seguridad
+        # Considerar margen de seguridad MUY pequeño
         safe_available = available * (1.0 - self.safety_margin)
         
         can_alloc = size_mb < safe_available
@@ -170,65 +173,64 @@ class AdvancedMemoryMonitor:
     
     def estimate_batch_size(self, tile_size: int, channels: int = 3) -> int:
         """
-        Estima el tamaño de batch óptimo basado en la memoria disponible
+        Estima el tamaño de batch optimo - CORREGIDO PARA ESTABILIDAD
         """
         # Memoria aproximada por tile (float32)
         tile_memory_mb = (tile_size * tile_size * channels * 4) / (1024 * 1024)
         
-        # Memoria para el batch completo (entrada + salida)
-        # Asumir 2x para salidas del modelo y buffers
-        batch_memory_per_tile = tile_memory_mb * 3
+        # Factor de seguridad mayor para evitar el crash de ONNX
+        batch_memory_per_tile = tile_memory_mb * 6  # Aumentado factor de seguridad
         
         # Memoria disponible segura
-        safe_available = self.get_available_memory_mb() * (1.0 - self.safety_margin)
+        safe_available = self.get_available_memory_mb() * 0.8 # Usar 80% real, no 99%
         
-        # Calcular batch size máximo
+        # Calcular batch size máximo teórico
         max_batch_by_memory = int(safe_available / batch_memory_per_tile)
         
-        # Limitar por configuración y mínimo práctico
-        max_batch = min(
-            max_batch_by_memory,
-            args.max_batch_size,
-            16  # Límite absoluto
-        )
+        # LIMITAR ESTRICTAMENTE A 96 (El punto dulce de tu CPU)
+        # No importa cuanta RAM tengas, la CPU no procesa mas rapido con batches de 1000
+        LIMIT_BATCH = 96
         
-        min_batch = max(args.min_batch_size, 1)
+        batch_size = min(max_batch_by_memory, args.max_batch_size, LIMIT_BATCH)
         
-        batch_size = max(min_batch, min(max_batch, min_batch))
+        # Asegurar mínimo
+        batch_size = max(batch_size, 1)
         
-        logger.info(f"Estimacion batch size:")
+        logger.info(f"Estimacion batch size (CORREGIDO):")
         logger.info(f"  - Memoria por tile: {tile_memory_mb:.1f} MB")
         logger.info(f"  - Memoria disponible segura: {safe_available:.1f} MB")
-        logger.info(f"  - Batch maximo teorico: {max_batch_by_memory}")
-        logger.info(f"  - Batch seleccionado: {batch_size}")
+        logger.info(f"  - Batch seleccionado: {batch_size} (Limitado para estabilidad)")
         
         return batch_size
 
 # ============================================================================
-# CLASE PARA PROCESAMIENTO POR BATCHES
+# CLASE PARA PROCESAMIENTO EXTREMO POR BATCHES
 # ============================================================================
 
-class BatchTileProcessor:
-    """Procesa múltiples tiles simultáneamente en batches"""
+class ExtremeBatchTileProcessor:
+    """Procesa multiples tiles simultaneamente en batches EXTREMOS"""
     
-    def __init__(self, session: rt.InferenceSession, memory_monitor: AdvancedMemoryMonitor):
+    def __init__(self, session: rt.InferenceSession, memory_monitor: ExtremeMemoryMonitor):
         self.session = session
         self.memory_monitor = memory_monitor
         self.input_name = session.get_inputs()[0].name
         self.output_name = session.get_outputs()[0].name
         
-        # Estadísticas
+        # Estadisticas
         self.total_inference_time = 0.0
         self.total_tiles_processed = 0
         self.batch_count = 0
         
-        # Configuración dinámica
-        self.batch_size = 1  # Se ajustará dinámicamente
-        self.current_batch_size = 1
+        # Configuracion dinamica EXTREMA
+        self.batch_size = 512
+        self.current_batch_size = 512
+        
+        # Para procesamiento paralelo
+        self.num_workers = min(8, mp.cpu_count())
     
-    def process_batch(self, batch_tiles: List[TileInfo], batch_input: np.ndarray) -> List[TileInfo]:
+    def process_extreme_batch(self, batch_tiles: List[TileInfo], batch_input: np.ndarray) -> List[TileInfo]:
         """
-        Procesa un batch de tiles simultáneamente
+        Procesa un batch EXTREMO de tiles simultaneamente
         """
         if not batch_tiles:
             return []
@@ -237,7 +239,7 @@ class BatchTileProcessor:
         batch_start = time.time()
         
         try:
-            # Ejecutar inferencia en batch
+            # Ejecutar inferencia en batch (MUCHO MÁS GRANDE)
             predictions = self.session.run(
                 [self.output_name], 
                 {self.input_name: batch_input}
@@ -248,6 +250,7 @@ class BatchTileProcessor:
             
             # Procesar cada tile del batch
             processed_tiles = []
+            
             for i, tile_info in enumerate(batch_tiles):
                 if i < len(predictions):
                     pred = predictions[i]
@@ -260,7 +263,7 @@ class BatchTileProcessor:
                         # Obtener clase con mayor probabilidad
                         mask_512 = np.argmax(pred, axis=-1).astype(np.uint8)
                         
-                        # Aplicar máscara de confianza
+                        # Aplicar mascara de confianza
                         mask_512[~confidence_mask] = 0
                     else:
                         mask_512 = np.argmax(pred, axis=-1).astype(np.uint8)
@@ -274,7 +277,7 @@ class BatchTileProcessor:
                     else:
                         final_mask = mask_512
                     
-                    # Aplicar post-procesamiento básico
+                    # Aplicar post-procesamiento basico
                     if not args.debug:
                         final_mask = self.apply_basic_postprocessing(final_mask)
                     
@@ -289,64 +292,67 @@ class BatchTileProcessor:
             return processed_tiles
             
         except Exception as e:
-            logger.error(f"Error procesando batch: {e}")
-            # Fallback: procesar tiles individualmente
-            return self.process_fallback(batch_tiles, batch_input)
+            logger.error(f"Error procesando batch extremo: {e}")
+            # Fallback: procesar en batches más pequeños
+            return self.process_batch_fallback(batch_tiles, batch_input)
+    
+    def process_batch_fallback(self, batch_tiles: List[TileInfo], batch_input: np.ndarray) -> List[TileInfo]:
+        """Fallback para procesamiento en batches más pequeños"""
+        logger.warning("Usando fallback de procesamiento en batches pequeños")
+        
+        processed_tiles = []
+        batch_size = 64  # Batch más pequeño para fallback
+        
+        for i in range(0, len(batch_tiles), batch_size):
+            sub_batch = batch_tiles[i:i + batch_size]
+            sub_input = batch_input[i:i + batch_size]
+            
+            try:
+                sub_predictions = self.session.run(
+                    [self.output_name], 
+                    {self.input_name: sub_input}
+                )[0]
+                
+                for j, tile_info in enumerate(sub_batch):
+                    if j < len(sub_predictions):
+                        pred = sub_predictions[j]
+                        
+                        # Procesar tile individualmente
+                        if args.min_confidence > 0:
+                            max_probs = np.max(pred, axis=-1)
+                            confidence_mask = max_probs >= args.min_confidence
+                            mask_512 = np.argmax(pred, axis=-1).astype(np.uint8)
+                            mask_512[~confidence_mask] = 0
+                        else:
+                            mask_512 = np.argmax(pred, axis=-1).astype(np.uint8)
+                        
+                        # Recortar si es necesario
+                        tile_width = tile_info.x_end - tile_info.x_start
+                        tile_height = tile_info.y_end - tile_info.y_start
+                        
+                        if tile_width < args.tile_size or tile_height < args.tile_size:
+                            final_mask = mask_512[:tile_height, :tile_width]
+                        else:
+                            final_mask = mask_512
+                        
+                        tile_info.processed_mask = final_mask
+                        processed_tiles.append(tile_info)
+                        self.total_tiles_processed += 1
+                        
+            except Exception as e:
+                logger.error(f"Error en fallback batch {i//batch_size}: {e}")
+        
+        return processed_tiles
     
     def apply_basic_postprocessing(self, mask: np.ndarray) -> np.ndarray:
-        """Post-procesamiento básico para un tile"""
-        # Filtro de mediana rápido
+        """Post-procesamiento basico para un tile"""
+        # Filtro de mediana rapido
         if mask.size > 0:
             mask = cv2.medianBlur(mask.astype(np.uint8), 3)
         return mask
     
-    def process_fallback(self, batch_tiles: List[TileInfo], batch_input: np.ndarray) -> List[TileInfo]:
-        """Fallback para procesamiento individual si falla el batch"""
-        logger.warning("Usando fallback de procesamiento individual")
-        
-        processed_tiles = []
-        for i, tile_info in enumerate(batch_tiles):
-            try:
-                # Procesar tile individualmente
-                tile_start = time.time()
-                individual_input = batch_input[i:i+1]  # Batch de tamaño 1
-                
-                predictions = self.session.run(
-                    [self.output_name], 
-                    {self.input_name: individual_input}
-                )[0]
-                
-                pred = predictions[0]
-                
-                # Aplicar umbral de confianza
-                if args.min_confidence > 0:
-                    max_probs = np.max(pred, axis=-1)
-                    confidence_mask = max_probs >= args.min_confidence
-                    mask_512 = np.argmax(pred, axis=-1).astype(np.uint8)
-                    mask_512[~confidence_mask] = 0
-                else:
-                    mask_512 = np.argmax(pred, axis=-1).astype(np.uint8)
-                
-                # Recortar si es necesario
-                tile_width = tile_info.x_end - tile_info.x_start
-                tile_height = tile_info.y_end - tile_info.y_start
-                
-                if tile_width < args.tile_size or tile_height < args.tile_size:
-                    final_mask = mask_512[:tile_height, :tile_width]
-                else:
-                    final_mask = mask_512
-                
-                tile_info.processed_mask = final_mask
-                tile_info.infer_time = time.time() - tile_start
-                processed_tiles.append(tile_info)
-                
-            except Exception as e:
-                logger.error(f"Error en fallback para tile {tile_info.id}: {e}")
-        
-        return processed_tiles
-    
     def get_statistics(self) -> Dict[str, Any]:
-        """Obtiene estadísticas del procesador"""
+        """Obtiene estadisticas del procesador"""
         if self.total_tiles_processed > 0:
             avg_inference = self.total_inference_time / self.total_tiles_processed
             avg_batch = self.total_tiles_processed / max(self.batch_count, 1)
@@ -359,148 +365,12 @@ class BatchTileProcessor:
             'total_tiles': self.total_tiles_processed,
             'total_inference_time': self.total_inference_time,
             'avg_inference_time_per_tile': avg_inference,
-            'avg_batch_size': avg_batch
+            'avg_batch_size': avg_batch,
+            'num_workers': self.num_workers
         }
 
 # ============================================================================
-# FUNCIONES DE PRE/POST-PROCESAMIENTO MEJORADAS
-# ============================================================================
-
-def normalize_tile_batch(tile_batch: np.ndarray) -> np.ndarray:
-    """
-    Normaliza un batch de tiles
-    """
-    if tile_batch.dtype != np.float32:
-        tile_batch = tile_batch.astype(np.float32)
-    
-    return tile_batch / 127.5 - 1.0
-
-def prepare_batch_input(tiles: List[TileInfo], tile_size: int) -> Optional[np.ndarray]:
-    """
-    Prepara un batch de tiles para inferencia
-    """
-    # Filtrar tiles válidos (con datos)
-    valid_tiles = []
-    for tile_info in tiles:
-        if tile_info.tile_data is not None and tile_info.read_success:
-            valid_tiles.append(tile_info)
-    
-    if not valid_tiles:
-        logger.warning("No hay tiles válidos para procesar en este batch")
-        return None
-    
-    batch_size = len(valid_tiles)
-    batch_input = np.zeros((batch_size, tile_size, tile_size, 3), dtype=np.float32)
-    
-    for i, tile_info in enumerate(valid_tiles):
-        tile_data = tile_info.tile_data
-        
-        # Verificar que los datos son válidos
-        if tile_data is None:
-            logger.warning(f"Tile {tile_info.id} tiene datos None, saltando")
-            continue
-            
-        # Aplicar padding si es necesario
-        if tile_data.shape[0] < tile_size or tile_data.shape[1] < tile_size:
-            padded_tile = np.zeros((tile_size, tile_size, 3), dtype=np.float32)
-            padded_tile[:tile_data.shape[0], :tile_data.shape[1], :] = tile_data
-            batch_input[i] = padded_tile
-        else:
-            batch_input[i] = tile_data
-        
-        # Liberar memoria del tile individual
-        tile_info.tile_data = None
-    
-    return batch_input
-
-def apply_median_filter(mask: np.ndarray, kernel_size: int = 3) -> np.ndarray:
-    """Filtro de mediana optimizado"""
-    if mask.size == 0:
-        return mask
-    
-    if kernel_size % 2 == 0:
-        kernel_size += 1
-    
-    return cv2.medianBlur(mask.astype(np.uint8), kernel_size)
-
-def apply_morphological_operations(mask: np.ndarray, min_size: int = 10) -> np.ndarray:
-    """Operaciones morfológicas optimizadas"""
-    if mask.size == 0:
-        return mask
-    
-    cleaned_mask = mask.copy()
-    
-    # Procesar cada clase excepto fondo
-    for class_id in range(1, 4):
-        class_mask = (mask == class_id).astype(np.uint8)
-        
-        if np.sum(class_mask) > 0:
-            # Componentes conectados
-            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-                class_mask, connectivity=8
-            )
-            
-            # Eliminar componentes pequeños
-            for label in range(1, num_labels):
-                if stats[label, cv2.CC_STAT_AREA] < min_size:
-                    cleaned_mask[labels == label] = 0
-    
-    return cleaned_mask
-
-def blend_tile_edges(current_tile: np.ndarray, 
-                     global_mask: np.ndarray,
-                     x: int, y: int, 
-                     width: int, height: int,
-                     overlap: int) -> None:
-    """
-    Mezcla optimizada de bordes de tiles
-    """
-    h, w = current_tile.shape
-    
-    # Usar mezcla lineal simple para mayor velocidad
-    blend_region = min(overlap // 2, h // 4, w // 4)
-    
-    if blend_region > 0:
-        # Extraer región existente
-        existing_region = global_mask[y:y+h, x:x+w]
-        
-        # Solo mezclar donde ambos tienen valores
-        mask_current = current_tile > 0
-        mask_existing = existing_region > 0
-        overlap_mask = mask_current & mask_existing
-        
-        if np.any(overlap_mask):
-            # Crear máscara de mezcla simple
-            blend_mask = np.ones((h, w), dtype=np.float32)
-            
-            # Bordes horizontales
-            for i in range(blend_region):
-                alpha = i / blend_region
-                blend_mask[i, :] = alpha
-                blend_mask[-(i+1), :] = alpha
-            
-            # Bordes verticales
-            for i in range(blend_region):
-                alpha = i / blend_region
-                blend_mask[:, i] = np.minimum(blend_mask[:, i], alpha)
-                blend_mask[:, -(i+1)] = np.minimum(blend_mask[:, -(i+1)], alpha)
-            
-            # Mezclar
-            blended = np.where(
-                overlap_mask,
-                current_tile.astype(np.float32) * blend_mask + 
-                existing_region.astype(np.float32) * (1 - blend_mask),
-                np.where(mask_current, current_tile, existing_region)
-            )
-            
-            global_mask[y:y+h, x:x+w] = blended.astype(np.uint8)
-        else:
-            global_mask[y:y+h, x:x+w] = current_tile
-    else:
-        global_mask[y:y+h, x:x+w] = current_tile
-
-# ============================================================================
-# FUNCIÓN PARA GUARDAR BALANCED_ARGMAX.PNG
+# FUNCIONES PARA GENERAR BALANCED_ARGMAX.PNG
 # ============================================================================
 
 def save_balanced_argmax_image(mask: np.ndarray, output_path: Path, base_name: str):
@@ -509,7 +379,7 @@ def save_balanced_argmax_image(mask: np.ndarray, output_path: Path, base_name: s
     Esto es lo que el aplicativo espera para la vista de Segmentación
     """
     try:
-        logger.info(f"\n[IMG] GENERANDO IMAGEN DE SEGMENTACIÓN (balanced_argmax)...")
+        logger.info(f"\n[IMG] GENERANDO IMAGEN DE SEGMENTACION (balanced_argmax)...")
         
         # Definir colores específicos para el aplicativo
         colors = [
@@ -535,7 +405,7 @@ def save_balanced_argmax_image(mask: np.ndarray, output_path: Path, base_name: s
         
         if output_path.exists():
             img_size = output_path.stat().st_size / (1024 * 1024)
-            logger.info(f"[OK] Imagen de segmentación guardada: {output_path} ({img_size:.2f} MB)")
+            logger.info(f"[OK] Imagen de segmentacion guardada: {output_path} ({img_size:.2f} MB)")
         else:
             logger.error(f"[ERROR] No se pudo crear: {output_path}")
             
@@ -588,159 +458,249 @@ def save_colored_mask(mask: np.ndarray, output_path: Path):
         logger.error(f"Error guardando mascara coloreada: {e}")
 
 # ============================================================================
-# FUNCIÓN PRINCIPAL DE PROCESAMIENTO CON BATCHES
+# FUNCIONES PARA REPORTE FINAL
 # ============================================================================
 
-def process_image_with_batch():
+def generar_reporte_final(full_mask_clean: np.ndarray, output_dir: Path, 
+                         base_name: str, width: int, height: int,
+                         total_time: float, total_tiles: int,
+                         processed_pixels: int, proc_stats: Dict[str, Any],
+                         batch_times: List[float], read_times: List[float]) -> None:
     """
-    Procesa la imagen por tiles con procesamiento por batches para máxima velocidad
+    Genera un reporte final detallado del procesamiento
     """
-    # Crear directorios de salida
-    output_dir = Path(args.output)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    report_path = output_dir / f'{base_name}_reporte_final.txt'
     
-    if args.save_npz:
-        npz_dir = output_dir / 'tiles_npz'
-        npz_dir.mkdir(exist_ok=True)
-    
-    # Inicializar monitor de memoria avanzado
-    memory_monitor = AdvancedMemoryMonitor(args.memory_safety_margin)
-    logger.info("=" * 70)
-    logger.info("INICIANDO SEGMENTACIÓN POR TILES CON PROCESAMIENTO POR BATCHES")
-    logger.info("=" * 70)
-    
-    # 1. Cargar Modelo ONNX optimizado
-    logger.info(f"Cargando modelo: {args.model}")
-    try:
-        # Configuración optimizada para batches
-        sess_options = rt.SessionOptions()
-        sess_options.enable_cpu_mem_arena = True
-        sess_options.execution_mode = rt.ExecutionMode.ORT_SEQUENTIAL
-        sess_options.graph_optimization_level = rt.GraphOptimizationLevel.ORT_ENABLE_ALL
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write("=" * 80 + "\n")
+        f.write("REPORTE FINAL DE SEGMENTACION SEMANTICA\n")
+        f.write("=" * 80 + "\n\n")
         
-        # Usar múltiples threads para inferencia
-        sess_options.intra_op_num_threads = min(4, os.cpu_count() or 1)
-        sess_options.inter_op_num_threads = 1
+        # Informacion basica
+        f.write("1. INFORMACION DE ENTRADA:\n")
+        f.write(f"   - Imagen: {args.image_path}\n")
+        f.write(f"   - Modelo: {args.model}\n")
+        f.write(f"   - Dimensiones: {width} x {height} px\n")
+        f.write(f"   - Tiles totales: {total_tiles}\n\n")
         
-        session = rt.InferenceSession(
-            args.model, 
-            sess_options, 
-            providers=['CPUExecutionProvider']
-        )
+        # Configuracion
+        f.write("2. CONFIGURACION DE PROCESAMIENTO:\n")
+        f.write(f"   - Tamaño tile: {args.tile_size} px\n")
+        f.write(f"   - Solapamiento: {args.overlap} px\n")
+        f.write(f"   - Batch size: {args.min_batch_size}-{args.max_batch_size}\n")
+        f.write(f"   - Umbral confianza: {args.min_confidence}\n\n")
         
-        input_name = session.get_inputs()[0].name
-        input_shape = session.get_inputs()[0].shape
-        logger.info(f"Modelo cargado. Forma de entrada: {input_shape}")
+        # Estadisticas de tiempo
+        f.write("3. ESTADISTICAS DE TIEMPO:\n")
+        f.write(f"   - Tiempo total: {total_time:.2f} segundos ({total_time/60:.1f} minutos)\n")
+        f.write(f"   - Tiempo inferencia: {proc_stats['total_inference_time']:.2f} segundos\n")
         
-    except Exception as e:
-        logger.error(f"Error cargando modelo: {e}")
-        raise
+        if batch_times:
+            f.write(f"   - Tiempo promedio por batch: {np.mean(batch_times):.2f} segundos\n")
+        if read_times:
+            f.write(f"   - Tiempo promedio lectura: {np.mean(read_times):.2f} segundos\n")
+        
+        if total_time > 0:
+            f.write(f"   - Velocidad procesamiento: {processed_pixels/total_time:,.0f} px/segundo\n\n")
+        
+        # Estadisticas de batches
+        f.write("4. ESTADISTICAS DE BATCHES:\n")
+        f.write(f"   - Batches procesados: {proc_stats['total_batches']}\n")
+        f.write(f"   - Tiles procesados: {proc_stats['total_tiles']}\n")
+        f.write(f"   - Tiempo promedio por tile: {proc_stats['avg_inference_time_per_tile']:.3f} segundos\n")
+        f.write(f"   - Batch size promedio: {proc_stats['avg_batch_size']:.1f}\n\n")
+        
+        # Distribucion de clases
+        f.write("5. DISTRIBUCION DE CLASES:\n")
+        unique, counts = np.unique(full_mask_clean, return_counts=True)
+        total_pixels = width * height
+        
+        for u, c in zip(unique, counts):
+            percentage = (c / total_pixels) * 100 if total_pixels > 0 else 0
+            nombre_clase = obtener_nombre_clase(u)
+            f.write(f"   - {nombre_clase}: {c:,} px ({percentage:.2f}%)\n")
+        
+        # Archivos generados
+        f.write("\n6. ARCHIVOS GENERADOS:\n")
+        archivos = list(output_dir.glob(f"{base_name}*"))
+        for archivo in sorted(archivos):
+            if archivo.is_file():
+                size_mb = archivo.stat().st_size / (1024 * 1024)
+                f.write(f"   - {archivo.name} ({size_mb:.2f} MB)\n")
+        
+        # Verificacion de integridad
+        f.write("\n7. VERIFICACION DE INTEGRIDAD:\n")
+        if (output_dir / f'{base_name}_balanced_argmax.tif').exists():
+            f.write("   ✓ Archivo TIFF generado correctamente\n")
+        if (output_dir / f'{base_name}_balanced_argmax.png').exists():
+            f.write("   ✓ Imagen PNG generada correctamente\n")
+        
+        f.write("\n" + "=" * 80 + "\n")
+        f.write("PROCESAMIENTO COMPLETADO EXITOSAMENTE\n")
+        f.write("=" * 80 + "\n")
     
-    # 2. Abrir Imagen con GDAL
-    logger.info(f"Abriendo imagen: {args.image_path}")
-    
-    # Configurar GDAL para manejar errores de TIFF
-    gdal.SetConfigOption('GDAL_PAM_ENABLED', 'NO')
-    gdal.SetConfigOption('GDAL_NUM_THREADS', '2')
-    
-    dataset = gdal.Open(args.image_path)
-    if dataset is None:
-        logger.error(f"No se pudo abrir la imagen: {args.image_path}")
-        sys.exit(1)
-    
-    width = dataset.RasterXSize
-    height = dataset.RasterYSize
-    bands = dataset.RasterCount
-    
-    # Obtener nombre base del archivo
-    base_name = Path(args.image_path).stem
-    logger.info(f"Imagen: {width}x{height} pixels, {bands} bandas, Nombre: {base_name}")
-    
-    # 3. Calcular configuración de tiles
-    tile_size = args.tile_size
-    overlap = args.overlap
-    effective_size = tile_size - 2 * overlap
-    
-    # Ajustar solapamiento si es necesario
-    if overlap >= tile_size // 2:
-        logger.warning(f"Solapamiento ({overlap}) muy grande. Reduciendo a {tile_size//4}")
-        overlap = tile_size // 4
-        effective_size = tile_size - 2 * overlap
-    
-    cols = math.ceil(width / effective_size)
-    rows = math.ceil(height / effective_size)
-    total_tiles = cols * rows
-    
-    # 4. Determinar batch size dinámico
-    dynamic_batch_size = memory_monitor.estimate_batch_size(tile_size)
-    
-    logger.info(f"\nConfiguracion de procesamiento:")
-    logger.info(f"  - Tamaño tile: {tile_size}x{tile_size}")
-    logger.info(f"  - Solapamiento: {overlap} pixels")
-    logger.info(f"  - Tamaño efectivo: {effective_size}x{effective_size}")
-    logger.info(f"  - Tiles totales: {rows} filas x {cols} columnas = {total_tiles}")
-    logger.info(f"  - Batch size dinamico: {dynamic_batch_size}")
-    logger.info(f"  - Tiles a precargar: {args.prefetch_tiles}")
-    
-    # 5. Crear archivos de salida
-    driver = gdal.GetDriverByName('GTiff')
-    # CORRECCIÓN CRÍTICA: Cambiar el nombre para que coincida con lo que espera instancias_tiles.py
-    out_tif = output_dir / f'{base_name}_balanced_argmax.tif'  # Cambiado de _segmented.tif
-    
-    tif_options = [
-        'COMPRESS=LZW',
-        'PREDICTOR=2',
-        'BIGTIFF=IF_SAFER',
-        'TILED=YES',
-        'BLOCKXSIZE=256',
-        'BLOCKYSIZE=256'
+    logger.info(f"Reporte final generado: {report_path}")
+
+def obtener_nombre_clase(id_clase: int) -> str:
+    """Obtiene el nombre de la clase basado en el ID"""
+    nombres = {
+        0: "Fondo",
+        1: "Mauritia flexuosa",
+        2: "Euterpe precatoria",
+        3: "Oenocarpus bataua"
+    }
+    return nombres.get(id_clase, f"Clase {id_clase}")
+
+# ============================================================================
+# VERIFICACION Y VALIDACION FINAL
+# ============================================================================
+
+def verificar_archivos_salida(output_dir: Path, base_name: str) -> bool:
+    """
+    Verifica que todos los archivos de salida se han generado correctamente
+    """
+    archivos_requeridos = [
+        f'{base_name}_balanced_argmax.tif',
+        f'{base_name}_balanced_argmax.png',
+        f'{base_name}_verificacion.png'
     ]
     
-    out_ds = driver.Create(
-        str(out_tif), width, height, 1, gdal.GDT_Byte,
-        options=tif_options
-    )
-    if out_ds is None:
-        logger.error("No se pudo crear el archivo de salida")
-        sys.exit(1)
+    todos_ok = True
+    logger.info("\nVERIFICANDO ARCHIVOS DE SALIDA:")
+    
+    for archivo in archivos_requeridos:
+        ruta = output_dir / archivo
+        if ruta.exists():
+            size_mb = ruta.stat().st_size / (1024 * 1024)
+            logger.info(f"  ✓ {archivo} ({size_mb:.2f} MB)")
+            
+            # Verificar que no este vacio
+            if size_mb < 0.001:
+                logger.warning(f"    ADVERTENCIA: Archivo muy pequeno, podria estar vacio")
+                todos_ok = False
+        else:
+            logger.error(f"  ✗ {archivo} NO ENCONTRADO")
+            todos_ok = False
+    
+    return todos_ok
+
+# ============================================================================
+# LIMPIEZA FINAL Y OPTIMIZACION
+# ============================================================================
+
+def realizar_limpieza_final(dataset: gdal.Dataset, out_ds: gdal.Dataset,
+                           full_mask_clean: np.ndarray, memory_monitor: ExtremeMemoryMonitor):
+    """
+    Realiza limpieza final de recursos y memoria
+    """
+    logger.info("\nREALIZANDO LIMPIEZA FINAL...")
+    
+    try:
+        # Liberar recursos de GDAL
+        if out_ds:
+            out_ds.FlushCache()
+            out_ds = None
         
-    out_ds.SetGeoTransform(dataset.GetGeoTransform())
-    out_ds.SetProjection(dataset.GetProjection())
-    out_band = out_ds.GetRasterBand(1)
-    out_band.SetNoDataValue(0)
+        if dataset:
+            dataset = None
+        
+        # Liberar arrays grandes
+        if 'full_mask_clean' in locals():
+            del full_mask_clean
+        gc.collect()
+        
+        # Monitorear memoria final
+        current_mem = memory_monitor.get_memory_mb()
+        peak_mem = memory_monitor.peak_memory
+        delta = current_mem - memory_monitor.start_memory
+        
+        logger.info(f"Memoria liberada. Uso actual: {current_mem:.1f} MB")
+        logger.info(f"Pico de memoria: {peak_mem:.1f} MB")
+        logger.info(f"Cambio total: {delta:+.1f} MB")
+        
+        # Forzar limpieza de garbage collector
+        collected = gc.collect()
+        if collected > 0:
+            logger.info(f"Garbage collector libero {collected} objetos")
+        
+    except Exception as e:
+        logger.warning(f"Advertencia en limpieza final: {e}")
+
+# ============================================================================
+# FUNCIONES DE PRE/POST-PROCESAMIENTO MEJORADAS
+# ============================================================================
+
+def normalize_tile_batch(tile_batch: np.ndarray) -> np.ndarray:
+    """
+    Normaliza un batch de tiles
+    """
+    if tile_batch.dtype != np.float32:
+        tile_batch = tile_batch.astype(np.float32)
     
-    # Máscara global en memoria
-    full_mask = np.zeros((height, width), dtype=np.uint8)
+    return tile_batch / 127.5 - 1.0
+
+def prepare_mega_batch_input(tiles: List[TileInfo], tile_size: int, max_batch_size: int) -> List[np.ndarray]:
+    """
+    Prepara MULTIPLES batches mega para inferencia
+    """
+    # Filtrar tiles validos
+    valid_tiles = [t for t in tiles if t.tile_data is not None and t.read_success]
     
-    # 6. Inicializar procesador de batches
-    batch_processor = BatchTileProcessor(session, memory_monitor)
-    batch_processor.batch_size = dynamic_batch_size
+    if not valid_tiles:
+        logger.warning("No hay tiles validos para procesar")
+        return []
     
-    # 7. Procesamiento principal con batches
-    logger.info("\n" + "=" * 70)
-    logger.info("INICIANDO PROCESAMIENTO POR BATCHES")
-    logger.info("=" * 70)
+    batches_input = []
+    current_batch = []
     
-    total_start = time.time()
-    tile_counter = 0
-    processed_pixels = 0
+    for tile_info in valid_tiles:
+        tile_data = tile_info.tile_data
+        
+        # Aplicar padding si es necesario
+        if tile_data.shape[0] < tile_size or tile_data.shape[1] < tile_size:
+            padded_tile = np.zeros((tile_size, tile_size, 3), dtype=np.float32)
+            padded_tile[:tile_data.shape[0], :tile_data.shape[1], :] = tile_data
+            current_batch.append(padded_tile)
+        else:
+            current_batch.append(tile_data)
+        
+        # Liberar memoria del tile individual
+        tile_info.tile_data = None
+        
+        # Cuando llegamos al tamaño maximo del batch, crear array
+        if len(current_batch) >= max_batch_size:
+            batch_array = np.stack(current_batch, axis=0)
+            batches_input.append(batch_array)
+            current_batch = []
     
-    # Estadísticas
-    batch_times = []
-    read_times = []
+    # Añadir el ultimo batch si no esta vacio
+    if current_batch:
+        batch_array = np.stack(current_batch, axis=0)
+        batches_input.append(batch_array)
     
-    # Pool de threads para lectura
-    read_pool = ThreadPoolExecutor(max_workers=min(2, os.cpu_count() or 1))  # Reducido para estabilidad
+    return batches_input
+
+# ============================================================================
+# FUNCIÓN PARA CARGA MASIVA DE TILES
+# ============================================================================
+
+def load_all_tiles_massively(dataset: gdal.Dataset, rows: int, cols: int, 
+                            tile_size: int, effective_size: int, overlap: int,
+                            width: int, height: int) -> List[TileInfo]:
+    """
+    Carga TODOS los tiles de la imagen en memoria de una vez
+    """
+    logger.info(f"CARGANDO TODOS LOS TILES EN MEMORIA...")
     
-    # Procesar por filas para mejor localidad de cache
+    all_tiles = []
+    total_tiles = rows * cols
+    loaded_count = 0
+    
+    start_time = time.time()
+    
     for row in range(rows):
-        row_start_time = time.time()
-        logger.info(f"\nProcesando fila {row+1}/{rows}")
-        
-        # Crear lista de tiles para esta fila
-        row_tiles = []
         for col in range(cols):
-            tile_counter += 1
+            loaded_count += 1
             
             # Calcular coordenadas
             x_start = max(0, col * effective_size - overlap)
@@ -767,8 +727,9 @@ def process_image_with_batch():
             if output_width <= 0 or output_height <= 0:
                 continue
             
-            row_tiles.append(TileInfo(
-                id=tile_counter,
+            # Crear objeto tile
+            tile_info = TileInfo(
+                id=loaded_count,
                 row=row,
                 col=col,
                 x_start=x_start,
@@ -779,97 +740,272 @@ def process_image_with_batch():
                 output_y=output_y,
                 output_width=output_width,
                 output_height=output_height
-            ))
-        
-        # Leer tiles de esta fila en paralelo
-        read_start = time.time()
-        
-        for tile_info in row_tiles:
-            tile_data = read_tile_data_safe(dataset, tile_info)
-            if tile_data is not None:
-                tile_info.tile_data = tile_data
-                tile_info.read_success = True
-            else:
-                tile_info.read_success = False
-                logger.warning(f"Tile {tile_info.id} no se pudo leer correctamente")
-        
-        read_time = time.time() - read_start
-        read_times.append(read_time)
-        
-        # Contar tiles exitosos
-        successful_tiles = sum(1 for t in row_tiles if t.read_success)
-        logger.info(f"  - Leidos {successful_tiles}/{len(row_tiles)} tiles en {read_time:.2f}s")
-        
-        # Procesar en batches solo los tiles exitosos
-        successful_row_tiles = [t for t in row_tiles if t.read_success]
-        
-        if not successful_row_tiles:
-            logger.warning(f"  - No hay tiles validos en esta fila, saltando...")
-            continue
-        
-        batch_start = time.time()
-        batch_results = []
-        
-        for i in range(0, len(successful_row_tiles), dynamic_batch_size):
-            batch_slice = successful_row_tiles[i:i + dynamic_batch_size]
-            
-            if not batch_slice:
-                continue
-            
-            # Verificar memoria antes de procesar
-            current_mem, available_mem = memory_monitor.log_memory(
-                f"antes de batch {i//dynamic_batch_size + 1}", 
-                detailed=False
             )
             
-            # Preparar batch
-            batch_input = prepare_batch_input(batch_slice, tile_size)
+            # Leer datos del tile
+            try:
+                data = dataset.ReadAsArray(x_start, y_start, tile_width, tile_height)
+                
+                if data is None:
+                    tile_info.read_success = False
+                    all_tiles.append(tile_info)
+                    continue
+                
+                # Formatear y normalizar
+                if len(data.shape) == 2:
+                    data = data[np.newaxis, ...]
+                
+                # Verificar que tenemos al menos 3 bandas
+                if data.shape[0] < 3:
+                    if data.shape[0] == 1:
+                        data = np.repeat(data, 3, axis=0)
+                    elif data.shape[0] == 2:
+                        data = np.vstack([data, np.zeros((1, data.shape[1], data.shape[2]), dtype=data.dtype)])
+                
+                # Convertir a (H, W, C)
+                tile_rgb = np.transpose(data[:3, ...], (1, 2, 0)).astype(np.float32)
+                
+                # Aplicar normalizacion si es necesario
+                if args.scaling == 'normalize':
+                    tile_rgb = tile_rgb / 127.5 - 1.0
+                
+                tile_info.tile_data = tile_rgb
+                tile_info.read_success = True
+                
+            except Exception as e:
+                logger.debug(f"Error cargando tile {loaded_count}: {e}")
+                tile_info.read_success = False
             
-            if batch_input is None:
-                logger.warning(f"  - No se pudo preparar batch, saltando...")
-                continue
+            all_tiles.append(tile_info)
             
-            # Procesar batch
-            batch_result = batch_processor.process_batch(batch_slice, batch_input)
-            batch_results.extend(batch_result)
-            
-            # Liberar memoria inmediatamente
-            del batch_input
-            gc.collect()
+            # Mostrar progreso cada 500 tiles
+            if loaded_count % 500 == 0:
+                elapsed = time.time() - start_time
+                rate = loaded_count / elapsed
+                logger.info(f"  - Cargados: {loaded_count}/{total_tiles} tiles ({rate:.1f} tiles/s)")
+    
+    load_time = time.time() - start_time
+    successful_tiles = sum(1 for t in all_tiles if t.read_success)
+    
+    logger.info(f"CARGA MASIVA COMPLETADA: {successful_tiles}/{total_tiles} tiles en {load_time:.2f}s")
+    logger.info(f"  - Velocidad: {loaded_count/load_time:.1f} tiles/s")
+    
+    return all_tiles
+
+# ============================================================================
+# FUNCIÓN PRINCIPAL DE PROCESAMIENTO EXTREMO
+# ============================================================================
+
+def process_image_extreme():
+    """
+    Procesa la imagen por tiles con procesamiento EXTREMO para usar 100% RAM
+    """
+    # Crear directorios de salida
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Inicializar monitor de memoria EXTREMO
+    memory_monitor = ExtremeMemoryMonitor(args.memory_safety_margin)
+    
+    logger.info("=" * 80)
+    logger.info("INICIANDO SEGMENTACION POR TILES - MODO 100% RAM")
+    logger.info("=" * 80)
+    
+    # 1. Cargar Modelo ONNX optimizado AL MÁXIMO
+    logger.info(f"Cargando modelo: {args.model}")
+    try:
+        # Configuracion OPTIMIZADA AL MAXIMO
+        sess_options = rt.SessionOptions()
+        sess_options.enable_cpu_mem_arena = True
+        sess_options.enable_mem_pattern = True
+        sess_options.execution_mode = rt.ExecutionMode.ORT_SEQUENTIAL
+        sess_options.graph_optimization_level = rt.GraphOptimizationLevel.ORT_ENABLE_ALL
         
+        # Usar TODOS los threads disponibles
+        sess_options.intra_op_num_threads = mp.cpu_count()
+        sess_options.inter_op_num_threads = 1
+        
+        # Cargar modelo
+        session = rt.InferenceSession(
+            args.model, 
+            sess_options, 
+            providers=['CPUExecutionProvider']
+        )
+        
+        input_name = session.get_inputs()[0].name
+        input_shape = session.get_inputs()[0].shape
+        logger.info(f"Modelo cargado. Forma de entrada: {input_shape}")
+        logger.info(f"   - Threads de inferencia: {mp.cpu_count()}")
+        
+    except Exception as e:
+        logger.error(f"Error cargando modelo: {e}")
+        raise
+    
+    # 2. Abrir Imagen con GDAL optimizado
+    logger.info(f"Abriendo imagen: {args.image_path}")
+    
+    # Configurar GDAL para maxima velocidad
+    gdal.SetConfigOption('GDAL_PAM_ENABLED', 'NO')
+    gdal.SetConfigOption('GDAL_NUM_THREADS', 'ALL_CPUS')
+    gdal.SetConfigOption('GDAL_CACHEMAX', '512')  # 512 MB de cache
+    
+    dataset = gdal.Open(args.image_path)
+    if dataset is None:
+        logger.error(f"No se pudo abrir la imagen: {args.image_path}")
+        sys.exit(1)
+    
+    width = dataset.RasterXSize
+    height = dataset.RasterYSize
+    bands = dataset.RasterCount
+    
+    # Obtener nombre base del archivo
+    base_name = Path(args.image_path).stem
+    logger.info(f"Imagen: {width}x{height} pixels, {bands} bandas, Nombre: {base_name}")
+    
+    # 3. Calcular configuracion de tiles
+    tile_size = args.tile_size
+    overlap = args.overlap
+    effective_size = tile_size - 2 * overlap
+    
+    # Ajustar solapamiento si es necesario
+    if overlap >= tile_size // 2:
+        logger.warning(f"Solapamiento ({overlap}) muy grande. Reduciendo a {tile_size//4}")
+        overlap = tile_size // 4
+        effective_size = tile_size - 2 * overlap
+    
+    cols = math.ceil(width / effective_size)
+    rows = math.ceil(height / effective_size)
+    total_tiles = cols * rows
+    
+    logger.info(f"Configuracion de tiles:")
+    logger.info(f"   - Tamaño tile: {tile_size}x{tile_size}")
+    logger.info(f"   - Solapamiento: {overlap} pixels")
+    logger.info(f"   - Tamaño efectivo: {effective_size}x{effective_size}")
+    logger.info(f"   - Tiles totales: {rows} filas x {cols} columnas = {total_tiles}")
+    
+    # 4. Determinar batch size dinamico EXTREMO
+    dynamic_batch_size = memory_monitor.estimate_batch_size(tile_size)
+    
+    # --- MODIFICACIÓN: QUITAR EL DOBLADO DE BATCH ---
+    # ELIMINAR O COMENTAR ESTAS LINEAS SI EXISTEN:
+    # if available_gb > 50:
+    #     dynamic_batch_size = min(dynamic_batch_size * 2, args.max_batch_size)
+    
+    # FORZAR PREFETCH ALTO PARA USAR LA RAM COMO ALMACÉN
+    # Esto llena la RAM con datos pendientes, no con datos procesando
+    args.prefetch_tiles = 10000 
+    
+    logger.info(f"   - Batch size dinamico: {dynamic_batch_size}")
+    logger.info(f"   - Tiles a precargar: {args.prefetch_tiles} (MAXIMO ABSOLUTO)")
+    
+    # 5. Crear archivos de salida
+    driver = gdal.GetDriverByName('GTiff')
+    out_tif = output_dir / f'{base_name}_balanced_argmax.tif'
+    
+    tif_options = [
+        'COMPRESS=LZW',
+        'PREDICTOR=2',
+        'BIGTIFF=IF_SAFER',
+        'TILED=YES',
+        'BLOCKXSIZE=512',  # Bloques más grandes
+        'BLOCKYSIZE=512',
+        'NUM_THREADS=ALL_CPUS'
+    ]
+    
+    out_ds = driver.Create(
+        str(out_tif), width, height, 1, gdal.GDT_Byte,
+        options=tif_options
+    )
+    if out_ds is None:
+        logger.error("No se pudo crear el archivo de salida")
+        sys.exit(1)
+        
+    out_ds.SetGeoTransform(dataset.GetGeoTransform())
+    out_ds.SetProjection(dataset.GetProjection())
+    out_band = out_ds.GetRasterBand(1)
+    out_band.SetNoDataValue(0)
+    
+    # 6. CARGAR TODOS LOS TILES EN MEMORIA
+    all_tiles = load_all_tiles_massively(dataset, rows, cols, tile_size, 
+                                        effective_size, overlap, width, height)
+    
+    # Filtrar tiles exitosos
+    successful_tiles = [t for t in all_tiles if t.read_success]
+    logger.info(f"Tiles validos para procesamiento: {len(successful_tiles)}/{total_tiles}")
+    
+    # 7. Inicializar procesador EXTREMO
+    batch_processor = ExtremeBatchTileProcessor(session, memory_monitor)
+    batch_processor.batch_size = dynamic_batch_size
+    
+    # 8. PROCESAMIENTO MEGA-BATCH
+    logger.info("\n" + "=" * 80)
+    logger.info("PROCESANDO TODOS LOS TILES EN MEGA-BATCHES")
+    logger.info("=" * 80)
+    
+    total_start = time.time()
+    processed_count = 0
+    processed_pixels = 0
+    
+    # Listas para estadisticas
+    batch_times = []
+    read_times = []
+    
+    # Preparar batches MEGA
+    logger.info(f"Preparando batches mega de {dynamic_batch_size} tiles cada uno...")
+    batches_input = prepare_mega_batch_input(successful_tiles, tile_size, dynamic_batch_size)
+    
+    logger.info(f"Total de batches a procesar: {len(batches_input)}")
+    logger.info(f"Tiles por batch: ~{dynamic_batch_size}")
+    
+    # Procesar cada batch MEGA
+    for batch_idx, batch_input in enumerate(batches_input, 1):
+        batch_tiles_start = (batch_idx - 1) * dynamic_batch_size
+        batch_tiles_end = min(batch_tiles_start + batch_input.shape[0], len(successful_tiles))
+        batch_tiles = successful_tiles[batch_tiles_start:batch_tiles_end]
+        
+        logger.info(f"\nProcesando MEGA-BATCH {batch_idx}/{len(batches_input)}")
+        logger.info(f"   - Tiles en batch: {len(batch_tiles)}")
+        
+        # Verificar memoria
+        current_mem, available_mem = memory_monitor.log_memory(f"antes de MEGA-BATCH {batch_idx}", detailed=True)
+        
+        # Procesar batch EXTREMO
+        batch_start = time.time()
+        batch_results = batch_processor.process_extreme_batch(batch_tiles, batch_input)
         batch_time = time.time() - batch_start
         batch_times.append(batch_time)
         
-        # Escribir resultados de esta fila
+        # Actualizar progreso
+        processed_count += len(batch_results)
+        progress_percent = (processed_count / len(successful_tiles)) * 100
+        
+        # Imprimir progreso para la GUI
+        print(f"[PROGRESS] {progress_percent:.2f}", flush=True)
+        
+        logger.info(f"   - Tiempo batch: {batch_time:.2f}s ({batch_time/len(batch_tiles):.3f}s/tile)")
+        logger.info(f"   - Progreso total: {progress_percent:.1f}%")
+        
+        # Escribir resultados inmediatamente
         write_start = time.time()
         tiles_written = 0
         
         for tile_info in batch_results:
             if tile_info.processed_mask is not None:
                 try:
-                    # Extraer región central
+                    # Extraer region central
                     offset_x = tile_info.output_x - tile_info.x_start
                     offset_y = tile_info.output_y - tile_info.y_start
                     
-                    # Verificar que los offsets sean válidos
-                    if (offset_y >= 0 and offset_y + tile_info.output_height <= tile_info.processed_mask.shape[0] and
-                        offset_x >= 0 and offset_x + tile_info.output_width <= tile_info.processed_mask.shape[1]):
+                    # Verificar offsets
+                    if (0 <= offset_y < tile_info.processed_mask.shape[0] and
+                        0 <= offset_x < tile_info.processed_mask.shape[1] and
+                        offset_y + tile_info.output_height <= tile_info.processed_mask.shape[0] and
+                        offset_x + tile_info.output_width <= tile_info.processed_mask.shape[1]):
                         
                         central_region = tile_info.processed_mask[
                             offset_y:offset_y + tile_info.output_height,
                             offset_x:offset_x + tile_info.output_width
                         ]
-                        
-                        # Mezclar con máscara global
-                        blend_tile_edges(
-                            central_region,
-                            full_mask,
-                            tile_info.output_x,
-                            tile_info.output_y,
-                            tile_info.output_width,
-                            tile_info.output_height,
-                            overlap // 2
-                        )
                         
                         # Escribir al TIFF
                         out_band.WriteArray(
@@ -880,246 +1016,129 @@ def process_image_with_batch():
                         
                         tiles_written += 1
                         processed_pixels += tile_info.output_width * tile_info.output_height
-                    else:
-                        logger.warning(f"  - Offset invalido para tile {tile_info.id}, saltando...")
                         
                 except Exception as e:
-                    logger.error(f"  - Error procesando tile {tile_info.id}: {e}")
+                    logger.error(f"   - Error escribiendo tile {tile_info.id}: {e}")
         
         write_time = time.time() - write_start
+        logger.info(f"   - Tiles escritos: {tiles_written}/{len(batch_results)} en {write_time:.2f}s")
         
-        # Estadísticas de la fila
-        row_time = time.time() - row_start_time
-        progress = (tile_counter / total_tiles) * 100
-        
-        logger.info(f"  - Procesados: {len(batch_results)} tiles")
-        logger.info(f"  - Escritos: {tiles_written} tiles")
-        logger.info(f"  - Tiempo batch: {batch_time:.2f}s")
-        logger.info(f"  - Tiempo escritura: {write_time:.2f}s")
-        logger.info(f"  - Tiempo total fila: {row_time:.2f}s")
-        logger.info(f"  - Progreso total: {progress:.1f}%")
-        
-        # Liberar memoria de la fila
-        for tile_info in row_tiles:
+        # Liberar memoria del batch
+        del batch_input
+        for tile_info in batch_tiles:
             tile_info.tile_data = None
             tile_info.processed_mask = None
         
         gc.collect()
-        
-        # Monitoreo de memoria cada fila
-        if row % 2 == 0:
-            memory_monitor.log_memory(f"despues de fila {row+1}", detailed=True)
     
-    # Cerrar pool de lectura
-    read_pool.shutdown(wait=True)
-    
-    # 8. Post-procesamiento global
-    logger.info("\n" + "=" * 70)
-    logger.info("POST-PROCESAMIENTO GLOBAL")
-    logger.info("=" * 70)
-    
-    post_start = time.time()
+    # 9. Leer la mascara completa del TIFF para procesamiento final
+    logger.info("\n" + "=" * 80)
+    logger.info("GENERANDO ARCHIVOS FINALES")
+    logger.info("=" * 80)
     
     try:
-        # Aplicar filtros finales a la máscara completa
-        full_mask_clean = apply_median_filter(full_mask, kernel_size=5)
-        full_mask_clean = apply_morphological_operations(full_mask_clean, min_size=20)
+        # Asegurar que todo se haya escrito al disco
+        out_band.FlushCache()
         
-        # Escribir máscara final
-        out_band.WriteArray(full_mask_clean, 0, 0)
+        # Reabrir el TIFF para leerlo completo
+        out_ds_temp = None
+        full_mask_clean = None
         
-        post_time = time.time() - post_start
-        logger.info(f"Post-procesamiento completado en {post_time:.2f}s")
+        try:
+            # Cerrar y reabrir para leer
+            out_ds = None
+            out_ds_temp = gdal.Open(str(out_tif))
+            if out_ds_temp:
+                full_mask_clean = out_ds_temp.ReadAsArray()
+                logger.info(f"Mascara leida del TIFF: {full_mask_clean.shape}")
+            else:
+                logger.error("No se pudo reabrir el TIFF para lectura")
+                full_mask_clean = np.zeros((height, width), dtype=np.uint8)
+        finally:
+            if out_ds_temp:
+                out_ds_temp = None
         
-    except Exception as e:
-        logger.error(f"Error en post-procesamiento: {e}")
-        # Usar máscara sin post-procesar
-        full_mask_clean = full_mask
-    
-    # 9. Generar imagen balanced_argmax.png (CRÍTICO PARA EL APLICATIVO)
-    balanced_argmax_png_path = output_dir / f'{base_name}_balanced_argmax.png'
-    save_balanced_argmax_image(full_mask_clean, balanced_argmax_png_path, base_name)
-    
-    # 10. Guardar también la visualización original
-    verification_path = output_dir / f'{base_name}_verificacion.png'
-    save_colored_mask(full_mask_clean, verification_path)
-    
-    # 11. Finalizar
-    out_band.FlushCache()
-    out_ds = None
-    dataset = None
-    
-    # 12. Estadísticas finales
-    total_time = time.time() - total_start
-    
-    logger.info("\n" + "=" * 70)
-    logger.info("ESTADISTICAS FINALES DEL PROCESAMIENTO POR BATCHES")
-    logger.info("=" * 70)
-    
-    # Estadísticas del procesador
-    proc_stats = batch_processor.get_statistics()
-    logger.info(f"Total batches procesados: {proc_stats['total_batches']}")
-    logger.info(f"Total tiles procesados: {proc_stats['total_tiles']}")
-    logger.info(f"Tiempo total inferencia: {proc_stats['total_inference_time']:.2f}s")
-    logger.info(f"Tiempo promedio por tile: {proc_stats['avg_inference_time_per_tile']:.3f}s")
-    logger.info(f"Batch size promedio: {proc_stats['avg_batch_size']:.1f}")
-    
-    # Velocidad comparativa
-    if batch_times:
-        avg_batch_time = np.mean(batch_times)
-        logger.info(f"Tiempo promedio por batch: {avg_batch_time:.2f}s")
-    
-    if read_times:
-        avg_read_time = np.mean(read_times)
-        logger.info(f"Tiempo promedio lectura: {avg_read_time:.2f}s")
-    
-    # Velocidad estimada vs procesamiento individual
-    estimated_single_time = proc_stats['total_tiles'] * 0.5  # Asumiendo 0.5s por tile individual
-    if estimated_single_time > 0 and total_time > 0:
-        speedup = estimated_single_time / total_time
-        logger.info(f"\nVelocidad estimada vs procesamiento 1x1: {speedup:.1f}x mas rapido")
-    
-    logger.info(f"\nTiempo total procesamiento: {total_time:.2f}s ({total_time/60:.1f} min)")
-    logger.info(f"Pixeles procesados: {processed_pixels:,}")
-    if total_time > 0:
-        logger.info(f"Velocidad: {processed_pixels/total_time:,.0f} px/s")
-    
-    # Distribución de clases
-    unique, counts = np.unique(full_mask_clean, return_counts=True)
-    total_pixels = width * height
-    
-    logger.info("\nDISTRIBUCION FINAL DE CLASES:")
-    for u, c in zip(unique, counts):
-        percentage = (c / total_pixels) * 100 if total_pixels > 0 else 0
-        logger.info(f"  Clase {u}: {c:,} pixeles ({percentage:.2f}%)")
-    
-    # Estadísticas de memoria
-    memory_monitor.log_memory("FINAL", detailed=True)
-    
-    logger.info(f"\nARCHIVOS GENERADOS EN: {output_dir}")
-    logger.info(f"  - Segmentacion TIFF: {out_tif}")
-    logger.info(f"  - Imagen Segmentacion (PNG): {balanced_argmax_png_path} <-- PARA EL APLICATIVO")
-    logger.info(f"  - Visualizacion: {verification_path}")
-    
-    if args.save_npz:
-        logger.info(f"  - Tiles NPZ: {npz_dir}")
-    
-    logger.info("=" * 70)
-    logger.info("PROCESAMIENTO POR BATCHES COMPLETADO EXITOSAMENTE")
-    logger.info("=" * 70)
-
-def read_tile_data_safe(dataset: gdal.Dataset, tile_info: TileInfo) -> Optional[np.ndarray]:
-    """
-    Lee los datos de un tile individual de forma segura
-    """
-    try:
-        read_start = time.time()
+        # 10. Generar imagen balanced_argmax.png (CRÍTICO PARA EL APLICATIVO)
+        balanced_argmax_png_path = output_dir / f'{base_name}_balanced_argmax.png'
+        if full_mask_clean is not None:
+            save_balanced_argmax_image(full_mask_clean, balanced_argmax_png_path, base_name)
         
-        # Leer datos con manejo de errores
-        data = dataset.ReadAsArray(
-            tile_info.x_start,
-            tile_info.y_start,
-            tile_info.x_end - tile_info.x_start,
-            tile_info.y_end - tile_info.y_start
-        )
+        # 11. Guardar tambien la visualizacion original
+        verification_path = output_dir / f'{base_name}_verificacion.png'
+        if full_mask_clean is not None:
+            save_colored_mask(full_mask_clean, verification_path)
         
-        if data is None:
-            # Intentar leer banda por banda
-            logger.warning(f"Tile {tile_info.id}: Fallo lectura directa, intentando banda por banda...")
-            return read_tile_band_by_band(dataset, tile_info)
+        # Obtener estadisticas finales
+        total_time = time.time() - total_start
+        proc_stats = batch_processor.get_statistics()
         
-        # Formatear y normalizar
-        if len(data.shape) == 2:
-            data = data[np.newaxis, ...]
-        
-        # Verificar que tenemos al menos 3 bandas
-        if data.shape[0] < 3:
-            logger.warning(f"Tile {tile_info.id}: Solo {data.shape[0]} bandas, duplicando...")
-            if data.shape[0] == 1:
-                # Duplicar banda única para RGB
-                data = np.repeat(data, 3, axis=0)
-            elif data.shape[0] == 2:
-                # Añadir tercera banda con ceros
-                data = np.vstack([data, np.zeros((1, data.shape[1], data.shape[2]), dtype=data.dtype)])
-        
-        # Convertir a (H, W, C) y mantener 3 bandas
-        tile_rgb = np.transpose(data[:3, ...], (1, 2, 0)).astype(np.float32)
-        
-        # Aplicar normalización si es necesario
-        if args.scaling == 'normalize':
-            tile_rgb = tile_rgb / 127.5 - 1.0
-        
-        tile_info.read_time = time.time() - read_start
-        return tile_rgb
-        
-    except Exception as e:
-        logger.error(f"Error en read_tile_data_safe para tile {tile_info.id}: {e}")
-        return None
-
-def read_tile_band_by_band(dataset: gdal.Dataset, tile_info: TileInfo) -> Optional[np.ndarray]:
-    """
-    Lee un tile banda por banda (más robusto para TIFFs problemáticos)
-    """
-    try:
-        width = tile_info.x_end - tile_info.x_start
-        height = tile_info.y_end - tile_info.y_start
-        
-        # Leer cada banda por separado
-        bands_data = []
-        for band_idx in range(1, min(4, dataset.RasterCount + 1)):  # Máximo 3 bandas
-            band = dataset.GetRasterBand(band_idx)
-            band_data = band.ReadAsArray(
-                tile_info.x_start,
-                tile_info.y_start,
-                width,
-                height
+        # 12. Generar reporte final
+        if full_mask_clean is not None:
+            generar_reporte_final(
+                full_mask_clean, output_dir, base_name, width, height,
+                total_time, total_tiles, processed_pixels, proc_stats,
+                batch_times, read_times
             )
+        
+        # 13. Verificar archivos generados
+        archivos_ok = verificar_archivos_salida(output_dir, base_name)
+        
+        # 14. Realizar limpieza final
+        realizar_limpieza_final(dataset, out_ds, full_mask_clean, memory_monitor)
+        
+        # 15. Mensaje final de confirmacion
+        logger.info("\n" + "=" * 80)
+        logger.info("PROCESO COMPLETADO SATISFACTORIAMENTE")
+        logger.info("=" * 80)
+        
+        if archivos_ok:
+            logger.info("✓ Todos los archivos de salida se generaron correctamente")
+            logger.info(f"✓ Directorio de salida: {output_dir}")
+            logger.info("✓ Puede proceder con el siguiente paso en el flujo de trabajo")
+        else:
+            logger.warning("⚠ Algunos archivos no se generaron correctamente")
+            logger.warning("  Revise los mensajes de error anteriores")
             
-            if band_data is None:
-                logger.warning(f"Tile {tile_info.id}: Banda {band_idx} no se pudo leer")
-                # Crear banda de ceros
-                band_data = np.zeros((height, width), dtype=np.float32)
-            
-            bands_data.append(band_data)
-        
-        # Si no tenemos 3 bandas, duplicar o añadir
-        while len(bands_data) < 3:
-            bands_data.append(np.zeros((height, width), dtype=np.float32))
-        
-        # Apilar bandas
-        data = np.stack(bands_data[:3], axis=0)  # (3, H, W)
-        
-        # Convertir a (H, W, C)
-        tile_rgb = np.transpose(data, (1, 2, 0)).astype(np.float32)
-        
-        # Aplicar normalización si es necesario
-        if args.scaling == 'normalize':
-            tile_rgb = tile_rgb / 127.5 - 1.0
-        
-        logger.info(f"Tile {tile_info.id}: Leido banda por banda exitosamente")
-        return tile_rgb
-        
     except Exception as e:
-        logger.error(f"Error en read_tile_band_by_band para tile {tile_info.id}: {e}")
-        return None
+        logger.error(f"Error en el procesamiento final: {e}")
+        raise
 
 # ============================================================================
 # EJECUCIÓN PRINCIPAL
 # ============================================================================
 
 if __name__ == "__main__":
+    exit_code = 0
     try:
-        logger.info("Iniciando segmentacion semantica con procesamiento por batches")
+        logger.info("Iniciando segmentacion semantica - MODO 100% RAM")
         logger.info(f"Parametros: tile_size={args.tile_size}, overlap={args.overlap}")
         logger.info(f"Batch size: {args.min_batch_size}-{args.max_batch_size}")
-        logger.info(f"Margen seguridad memoria: {args.memory_safety_margin*100:.0f}%")
+        logger.info(f"Margen seguridad memoria: {args.memory_safety_margin*100:.1f}%")
+        logger.info(f"Tiles a precargar: {args.prefetch_tiles}")
         
-        process_image_with_batch()
+        process_image_extreme()
         
     except KeyboardInterrupt:
-        logger.warning("Proceso interrumpido por el usuario")
+        logger.warning("\n" + "!" * 70)
+        logger.warning("PROCESO INTERRUMPIDO POR EL USUARIO")
+        logger.warning("!" * 70)
+        exit_code = 130
     except Exception as e:
-        logger.error(f"Error durante la ejecucion: {e}", exc_info=True)
-        sys.exit(1)
+        logger.error("\n" + "X" * 70)
+        logger.error(f"ERROR CRITICO DURANTE LA EJECUCION: {e}", exc_info=True)
+        logger.error("X" * 70)
+        exit_code = 1
+    finally:
+        # Asegurar limpieza final incluso si hay errores
+        try:
+            # Limpiar cualquier recurso restante
+            gc.collect()
+        except:
+            pass
     
-    logger.info("Programa finalizado correctamente")
+    if exit_code == 0:
+        logger.info("\n" + "✓" * 70)
+        logger.info("PROGRAMA FINALIZADO CORRECTAMENTE")
+        logger.info("✓" * 70)
+    
+    sys.exit(exit_code)

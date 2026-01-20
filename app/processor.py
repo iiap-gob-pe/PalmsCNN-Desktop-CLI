@@ -8,13 +8,46 @@ from PIL import Image
 import time
 import rasterio
 from rasterio.windows import Window
+import re
+import threading
+import queue
+import psutil
+import glob
+import pandas as pd
 
+# ============================================================================
+# CLASE SPINNER (ANIMACIÓN DE CARGA)
+# ============================================================================
+class ConsoleSpinner:
+    """Clase para mostrar una animación en la terminal mientras se espera"""
+    def __init__(self, message="Procesando... no cierre la ventana"):
+        self.message = message
+        self.frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        self.idx = 0
+        
+    def next_frame(self):
+        """Retorna el siguiente cuadro de la animación"""
+        frame = self.frames[self.idx % len(self.frames)]
+        self.idx += 1
+        return f"\r{frame} {self.message} "
 
-def run_command_with_terminal_output(cmd, cwd=None):
-    """Ejecuta comando y muestra output en terminal en tiempo real"""
-    print(f"\n[TERMINAL] Ejecutando comando: {' '.join(cmd)}")
-    sys.stdout.flush()  # Forzar salida inmediata
+# ============================================================================
+# FUNCIÓN DE EJECUCIÓN CON ANIMACIÓN
+# ============================================================================
+
+def run_command_with_terminal_output(cmd, cwd=None, progress_callback=None, progress_range=(0, 100)):
+    """Ejecuta comando y muestra animación mientras espera output."""
+    print(f"\n[TERMINAL] Ejecutando: {' '.join(cmd)}")
+    sys.stdout.flush()
     
+    out_queue = queue.Queue()
+    
+    def read_output(process, q):
+        """Hilo secundario que lee la salida del proceso"""
+        for line in iter(process.stdout.readline, ''):
+            q.put(line)
+        process.stdout.close()
+
     try:
         process = subprocess.Popen(
             cmd,
@@ -28,32 +61,61 @@ def run_command_with_terminal_output(cmd, cwd=None):
             errors='replace'
         )
         
-        # Capturar y mostrar output en tiempo real
-        output_lines = []
+        t = threading.Thread(target=read_output, args=(process, out_queue))
+        t.daemon = True
+        t.start()
+        
+        start_pct, end_pct = progress_range
+        range_span = end_pct - start_pct
+        
+        spinner = ConsoleSpinner("Procesando... por favor espere")
+        last_activity = time.time()
+        
         while True:
-            line = process.stdout.readline()
-            if line:
-                print(f"[SCRIPT] {line.rstrip()}")
+            try:
+                line = out_queue.get(timeout=0.1)
+                sys.stdout.write("\r" + " " * 60 + "\r")
+                
+                line_str = line.rstrip()
+                if line_str:
+                    print(f"[SCRIPT] {line_str}")
+                    sys.stdout.flush()
+                    
+                    if progress_callback and "[PROGRESS]" in line_str:
+                        try:
+                            parts = line_str.split("[PROGRESS]")
+                            if len(parts) > 1:
+                                number_part = parts[1].strip().split()[0]
+                                script_percent = float(number_part)
+                                global_percent = start_pct + (script_percent / 100.0 * range_span)
+                                global_percent = max(start_pct, min(end_pct, global_percent))
+                                progress_callback(int(global_percent))
+                        except ValueError:
+                            pass
+                
+                last_activity = time.time()
+                
+            except queue.Empty:
+                if process.poll() is not None and out_queue.empty():
+                    break
+                
+                sys.stdout.write(spinner.next_frame())
                 sys.stdout.flush()
-                output_lines.append(line)
-            elif process.poll() is not None:
-                break
         
-        # Capturar cualquier salida restante
-        remaining = process.stdout.read()
-        if remaining:
-            print(f"[SCRIPT] {remaining.rstrip()}")
-            sys.stdout.flush()
-            output_lines.append(remaining)
+        sys.stdout.write("\r" + " " * 60 + "\r")
+        sys.stdout.flush()
         
-        process.wait()
+        t.join(timeout=1)
         return process.returncode
         
     except Exception as e:
-        print(f"[ERROR] Error ejecutando comando: {e}")
+        print(f"\n[ERROR] Error ejecutando comando: {e}")
         return 1
-    
-# Manejo robusto de importaciones
+
+# ============================================================================
+# IMPORTACIONES Y CLASE PRINCIPAL
+# ============================================================================
+
 try:
     from .tile_processor import EfficientTileProcessor
     from .memory_optimizer import analyze_image_processing, calculate_optimal_tile_size, estimate_tile_memory_usage_mb, get_available_memory_mb
@@ -80,7 +142,6 @@ logger = logging.getLogger(__name__)
 
 class PalmProcessor:
     def __init__(self, config_path=None):
-        # Inicializar logger primero
         self.logger = self._setup_logger()
         
         if config_path is None:
@@ -88,50 +149,47 @@ class PalmProcessor:
         self.config = self.load_config(config_path)
         self.setup_paths()
         
-        # DIAGNOSTICO: Verificar configuración de modelos
         self.log("DIAGNOSTICO - Configuración de modelos:")
         models_config = self.config.get("models", {})
-        self.log(f"   Models config: {models_config}")
+        self.log(f"    Models config: {models_config}")
         
-        # Verificar si los archivos de modelos existen
         if "segmentacion" in models_config:
             seg_path = models_config["segmentacion"]
             exists = os.path.exists(seg_path)
-            self.log(f"   Modelo segmentación: {seg_path} - {'EXISTE' if exists else 'NO EXISTE'}")
+            self.log(f"    Modelo segmentación: {seg_path} - {'EXISTE' if exists else 'NO EXISTE'}")
         
         if "instancias" in models_config:
             inst_path = models_config["instancias"]
             exists = os.path.exists(inst_path)
-            self.log(f"   Modelo instancias: {inst_path} - {'EXISTE' if exists else 'NO EXISTE'}")
+            self.log(f"    Modelo instancias: {inst_path} - {'EXISTE' if exists else 'NO EXISTE'}")
         
-        # Inicializar tile processor
         self.tile_processor = EfficientTileProcessor(self.config)
         
-        # PARAMETROS DEL DECISOR
         self.model_overhead_mb = 400
         self.ram_safety_threshold = 0.7
         self.min_tile_size = (128, 128)
         self.max_tile_size = (1024, 1024)
 
+    def _get_dynamic_resources(self):
+        """MODO 128GB: Configuración EXTREMA forzada manualmente."""
+        self.log(f"⚡ MODO ULTRA RAM (HARDCODED) - FORZANDO MAXIMA POTENCIA")
+        target_mb = 90000
+        batch_size = 128
+        self.log(f"   ► RAM Forzada: {target_mb} MB")
+        self.log(f"   ► Batch Size Forzado: {batch_size}")
+        return target_mb, batch_size
+
     def _setup_logger(self):
         """Configurar logger para PalmProcessor"""
         import logging
-        
-        # Crear logger específico para PalmProcessor
         logger = logging.getLogger('PalmProcessor')
         logger.setLevel(logging.INFO)
-        
-        # Solo agregar handlers si no existen
         if not logger.handlers:
-            # Handler para consola
             console_handler = logging.StreamHandler()
             console_formatter = logging.Formatter('[PalmProcessor] %(message)s')
             console_handler.setFormatter(console_formatter)
             logger.addHandler(console_handler)
-            
-            # Evitar propagación al logger root
             logger.propagate = False
-        
         return logger
     
     def log(self, message):
@@ -141,7 +199,6 @@ class PalmProcessor:
     def get_image_dimensions(self, image_path):
         """Obtener dimensiones de una imagen usando GDAL o rasterio"""
         try:
-            # Intentar con GDAL primero
             from osgeo import gdal
             dataset = gdal.Open(image_path)
             if dataset:
@@ -151,7 +208,6 @@ class PalmProcessor:
                 return f"{width}x{height}"
         except:
             try:
-                # Intentar con rasterio
                 import rasterio
                 with rasterio.open(image_path) as src:
                     width = src.width
@@ -159,21 +215,21 @@ class PalmProcessor:
                     return f"{width}x{height}"
             except:
                 try:
-                    # Intentar con PIL como último recurso
                     from PIL import Image
                     with Image.open(image_path) as img:
                         width, height = img.size
                         return f"{width}x{height}"
                 except:
                     pass
+        return "Desconocido"
         
-        return "Desconocido"    
         
+
     def find_config_file(self):
         """Buscar config.json en ubicaciones posibles"""
         possible_paths = [
             "config.json",
-            "../config.json", 
+            "../config.json",
             "./config.json",
             os.path.join(os.path.dirname(__file__), "..", "config.json"),
         ]
@@ -252,14 +308,12 @@ class PalmProcessor:
         """Configurar rutas y crear directorios necesarios"""
         base_dir = os.path.dirname(os.path.dirname(__file__)) if "__file__" in locals() else os.getcwd()
         
-        # Asegurar que las rutas de scripts sean absolutas
         for script_type in ["segmentacion", "instancias", "segmentacion_tiles", "instancias_tiles"]:
             if script_type in self.config["scripts"]:
                 script_path = self.config["scripts"][script_type]
                 if not os.path.isabs(script_path):
                     self.config["scripts"][script_type] = os.path.join(base_dir, script_path)
         
-        # Crear directorio de salida
         output_dir = self.config["output"]["directory"]
         if not os.path.isabs(output_dir):
             output_dir = os.path.join(base_dir, output_dir)
@@ -270,25 +324,221 @@ class PalmProcessor:
         self.log(f"Directorio de salida: {output_dir}")
 
     # ===================================================================
-    # NUEVO MÉTODO: PROCESAMIENTO CON TILES AVANZADO (MODO OPTIMIZADO)
+    # NUEVO: FUNCIONES PARA DIAGNÓSTICO Y LECTURA ROBUSTA DE CSV
+    # ===================================================================
+
+    def _analyze_dataframe(self, df, csv_path):
+        """Analizar un DataFrame para extraer estadísticas de especies"""
+        try:
+            total_rows = len(df)
+            
+            # ESTRATEGIA 1: Buscar columna de especie por nombre común
+            especie_col = None
+            col_names_lower = [str(col).lower() for col in df.columns]
+            
+            patterns = ['especie', 'species', 'class', 'clase', 'tipo', 'type', 'categoria']
+            
+            for pattern in patterns:
+                for i, col_name in enumerate(col_names_lower):
+                    if pattern in col_name:
+                        especie_col = df.columns[i]
+                        self.log(f"   ✓ Columna de especie encontrada: '{especie_col}' (patrón: '{pattern}')")
+                        break
+                if especie_col:
+                    break
+            
+            # ESTRATEGIA 2: Si no encontramos, buscar columna con valores de especies conocidas
+            if not especie_col:
+                species_values = ['mauritia', 'euterpe', 'oenocarpus', 'flexuosa', 'precatoria', 'bataua']
+                for col in df.columns:
+                    if df[col].dtype == 'object':
+                        sample_values = df[col].dropna().astype(str).str.lower()
+                        for species in species_values:
+                            if sample_values.str.contains(species).any():
+                                especie_col = col
+                                self.log(f"   ✓ Columna de especie inferida: '{col}' (contiene '{species}')")
+                                break
+                    if especie_col:
+                        break
+            
+            # ESTRATEGIA 3: Contar basado en valores encontrados
+            if especie_col:
+                df['especie_norm'] = df[especie_col].astype(str).str.lower().str.strip()
+                
+                mau_count = len(df[df['especie_norm'].str.contains('mauritia|flexuosa')])
+                eut_count = len(df[df['especie_norm'].str.contains('euterpe|precatoria')])
+                oeno_count = len(df[df['especie_norm'].str.contains('oenocarpus|bataua')])
+                
+                other_count = total_rows - (mau_count + eut_count + oeno_count)
+                
+                if other_count > 0:
+                    self.log(f"   ⚠️ {other_count} objetos no clasificados como especies conocidas")
+                
+                return f"Total: {total_rows} palmeras (Mauritia: {mau_count}, Euterpe: {eut_count}, Oenocarpus: {oeno_count})"
+            
+            # ESTRATEGIA 4: Si no hay columna de especie, contar filas totales
+            else:
+                self.log(f"   ⚠️ No se identificó columna de especie. Columnas disponibles: {list(df.columns)}")
+                return f"Total: {total_rows} objetos detectados (especies no especificadas)"
+                
+        except Exception as e:
+            self.log(f"   Error analizando DataFrame: {e}")
+            return None
+
+    def _extract_stats_from_script_logs(self, output_dir, base_name):
+        """Extraer estadísticas de archivos de log generados por el script"""
+        try:
+            import re
+            
+            log_files = []
+            patterns = [
+                f"{base_name}*.txt",
+                f"{base_name}*.log",
+                "*.log",
+                "*reporte*.txt",
+                "*resultados*.txt"
+            ]
+            
+            for pattern in patterns:
+                log_files.extend(glob.glob(os.path.join(output_dir, pattern)))
+            
+            self.log(f"   Buscando en {len(log_files)} archivos de log...")
+            
+            for log_file in log_files:
+                try:
+                    with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                    
+                    patterns = [
+                        r"Mauritia flexuosa:\s*(\d+)",
+                        r"Euterpe precatoria:\s*(\d+)",
+                        r"Oenocarpus bataua:\s*(\d+)",
+                        r"TOTAL:\s*(\d+)",
+                        r"Total:\s*(\d+)",
+                        r"Total.*?(\d+).*?palmeras"
+                    ]
+                    
+                    results = {}
+                    for pattern in patterns:
+                        matches = re.findall(pattern, content, re.IGNORECASE)
+                        for match in matches:
+                            if pattern.startswith("Mauritia"):
+                                results['mauritia'] = int(match)
+                            elif pattern.startswith("Euterpe"):
+                                results['euterpe'] = int(match)
+                            elif pattern.startswith("Oenocarpus"):
+                                results['oenocarpus'] = int(match)
+                            elif 'TOTAL' in pattern or 'Total:' in pattern:
+                                results['total'] = int(match)
+                    
+                    if results:
+                        mau = results.get('mauritia', 0)
+                        eut = results.get('euterpe', 0)
+                        oeno = results.get('oenocarpus', 0)
+                        total = results.get('total', mau + eut + oeno)
+                        
+                        return f"Total: {total} palmeras (Mauritia: {mau}, Euterpe: {eut}, Oenocarpus: {oeno})"
+                        
+                except Exception as e:
+                    continue
+            
+            return None
+        except Exception as e:
+            self.log(f"   Error extrayendo estadísticas de logs: {e}")
+            return None
+
+    def _read_final_statistics(self, base_name, output_dir):
+        """
+        FUNCIÓN CORREGIDA: Lee las estadísticas priorizando el CSV de resumen,
+        luego el CSV de atributos, y solo como último recurso intenta logs.
+        """
+        try:
+            self.log("=" * 70)
+            self.log("🔍 INICIANDO DIAGNÓSTICO DE ESTADÍSTICAS (LÓGICA HÍBRIDA CORREGIDA)")
+            self.log("=" * 70)
+            
+            output_dir = os.path.normpath(output_dir)
+            
+            # 1. PRIORIDAD MÁXIMA: CSV de resumen (el que tiene ESPECIE,CONTEO)
+            summary_csv = os.path.join(output_dir, f"{base_name}_predicted_summary.csv")
+            
+            if os.path.exists(summary_csv):
+                self.log(f"✅ Encontrado CSV de resumen: {summary_csv}")
+                df = pd.read_csv(summary_csv)
+                self.log(f"   Columnas: {list(df.columns)}")
+                
+                # Normalizar nombres de columnas
+                df.columns = [c.strip().upper() for c in df.columns]
+                
+                mau = df.loc[df['ESPECIE'].str.contains('MAURITIA', case=False, na=False), 'CONTEO'].iloc[0] if not df[df['ESPECIE'].str.contains('MAURITIA', case=False, na=False)].empty else 0
+                eut = df.loc[df['ESPECIE'].str.contains('EUTERPE', case=False, na=False), 'CONTEO'].iloc[0] if not df[df['ESPECIE'].str.contains('EUTERPE', case=False, na=False)].empty else 0
+                oeno = df.loc[df['ESPECIE'].str.contains('OENOCARPUS', case=False, na=False), 'CONTEO'].iloc[0] if not df[df['ESPECIE'].str.contains('OENOCARPUS', case=False, na=False)].empty else 0
+                
+                total_row = df[df['ESPECIE'].str.contains('TOTAL', case=False, na=False)]
+                total = int(total_row['CONTEO'].iloc[0]) if not total_row.empty else (mau + eut + oeno)
+                
+                result_str = f"Total: {total} palmeras (Mauritia: {mau}, Euterpe: {eut}, Oenocarpus: {oeno})"
+                self.log(f"📊 {result_str}")
+                return result_str
+
+            # 2. FALLBACK: CSV de atributos detallados (una fila por palmera)
+            atributos_csv = os.path.join(output_dir, f"{base_name}_atributos.csv")
+            if os.path.exists(atributos_csv):
+                self.log(f"⚠️ CSV resumen no encontrado, usando atributos detallados: {atributos_csv}")
+                df = pd.read_csv(atributos_csv)
+                self.log(f"   Filas detectadas: {len(df)}")
+                
+                if 'ESPECIE' in df.columns:
+                    df['ESPECIE_NORM'] = df['ESPECIE'].astype(str).str.lower()
+                    mau = len(df[df['ESPECIE_NORM'].str.contains('mauritia|flexuosa')])
+                    eut = len(df[df['ESPECIE_NORM'].str.contains('euterpe|precatoria')])
+                    oeno = len(df[df['ESPECIE_NORM'].str.contains('oenocarpus|bataua')])
+                    total = len(df)
+                    result_str = f"Total: {total} palmeras (Mauritia: {mau}, Euterpe: {eut}, Oenocarpus: {oeno})"
+                    self.log(f"📊 {result_str}")
+                    return result_str
+                else:
+                    self.log("   No se encontró columna ESPECIE")
+                    return f"Total detectado: {len(df)} objetos (sin clasificación por especie)"
+
+            # 3. ÚLTIMO RECURSO: intentar leer logs (mejorado, pero solo si no hay CSV)
+            self.log("⚠️ Ningún CSV encontrado, intentando leer logs...")
+            stats_from_logs = self._extract_stats_from_script_logs(output_dir, base_name)
+            if stats_from_logs:
+                self.log(f"📊 {stats_from_logs}")
+                return stats_from_logs
+                
+            return "No se pudieron leer las estadísticas finales"
+
+        except Exception as e:
+            self.log(f"❌ Error leyendo estadísticas: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+            return "Error en lectura de estadísticas"
+
+    # ===================================================================
+    # MÉTODO DE PROCESAMIENTO CON TILES AVANZADO (MODO OPTIMIZADO)
     # ===================================================================
 
     def _process_with_advanced_tiles(self, image_path: str, progress_callback=None) -> str:
-        """
-        MODO OPTIMIZADO: Usa los scripts de tiles avanzados process_with_tiles.py e instancias_tiles.py
-        """
+        """MODO OPTIMIZADO: Usa los scripts de tiles avanzados"""
         try:
             self.log("=" * 70)
             self.log("🚀 MODO OPTIMIZADO - USANDO SCRIPTS DE TILES AVANZADOS")
             self.log("=" * 70)
             
-            base_name = os.path.basename(image_path).split('.')[0]
-            output_dir = self.config["output"]["directory"]
+            memoria_turbo, batch_turbo = self._get_dynamic_resources()
+            
+            # CORRECCIÓN CRÍTICA: Usar splitext para nombre base
+            base_name = os.path.splitext(os.path.basename(image_path))[0]
+            
+            # Normalizar ruta de salida
+            output_dir = os.path.normpath(self.config["output"]["directory"])
             
             if progress_callback:
-                progress_callback(10, "Iniciando segmentación por tiles avanzada...")
+                progress_callback(10)
             
-            # 1. SEGMENTACIÓN POR TILES (process_with_tiles.py)
+            # 1. SEGMENTACIÓN POR TILES
             self.log("🧩 Ejecutando segmentación por tiles optimizada...")
             
             seg_tiles_script = self.config["scripts"]["segmentacion_tiles"]
@@ -296,7 +546,6 @@ class PalmProcessor:
             if not os.path.exists(seg_tiles_script):
                 raise FileNotFoundError(f"Script de segmentación por tiles no encontrado: {seg_tiles_script}")
             
-            # Obtener parámetros de segmentación por tiles
             seg_tiles_params = self.config["parameters"]["segmentacion_tiles"]
             
             cmd_seg = [
@@ -307,30 +556,35 @@ class PalmProcessor:
                 "--output", output_dir,
                 "--tile_size", str(seg_tiles_params["tile_size"]),
                 "--overlap", str(seg_tiles_params["overlap"]),
-                "--scaling", seg_tiles_params["scaling"]
+                "--scaling", seg_tiles_params["scaling"],
+                "--max_batch_size", str(batch_turbo),
+                "--min_batch_size", str(batch_turbo),
+                "--memory_safety_margin", "0.1",
             ]
             
-            # Agregar parámetros opcionales si existen
-            if "max_batch_size" in seg_tiles_params:
-                cmd_seg.extend(["--max_batch_size", str(seg_tiles_params["max_batch_size"])])
-            
-            if "min_batch_size" in seg_tiles_params:
-                cmd_seg.extend(["--min_batch_size", str(seg_tiles_params["min_batch_size"])])
-            
-            if "memory_safety_margin" in seg_tiles_params:
-                cmd_seg.extend(["--memory_safety_margin", str(seg_tiles_params["memory_safety_margin"])])
+            if batch_turbo > 16:
+                cmd_seg.extend(["--max_batch_size", "1024"])
+                cmd_seg.extend(["--min_batch_size", "512"])
+                cmd_seg.extend(["--memory_safety_margin", "0.005"])
+                cmd_seg.extend(["--prefetch_tiles", "10000"])
             
             project_dir = os.path.dirname(os.path.dirname(__file__)) if "__file__" in locals() else os.getcwd()
             
-            self.log(f"📊 Parámetros segmentación por tiles:")
-            self.log(f"   • Tile size: {seg_tiles_params['tile_size']}")
-            self.log(f"   • Overlap: {seg_tiles_params['overlap']}")
-            self.log(f"   • Escalado: {seg_tiles_params['scaling']}")
+            self.log(f"📊 Parámetros segmentación por tiles (MODO 128):")
+            self.log(f"    • Tile size: {seg_tiles_params['tile_size']}")
+            self.log(f"    • Overlap: {seg_tiles_params['overlap']}")
+            self.log(f"    • Escalado: {seg_tiles_params['scaling']}")
+            self.log(f"    • Batch Size: {batch_turbo} tiles simultáneos")
             
             if progress_callback:
-                progress_callback(30, "Segmentación por tiles en progreso...")
+                progress_callback(30)
             
-            returncode_seg = run_command_with_terminal_output(cmd_seg, cwd=project_dir)
+            returncode_seg = run_command_with_terminal_output(
+                cmd_seg,
+                cwd=project_dir,
+                progress_callback=progress_callback,
+                progress_range=(5, 60)
+            )
             
             if returncode_seg != 0:
                 raise Exception(f"Error en segmentación por tiles (código {returncode_seg})")
@@ -338,13 +592,11 @@ class PalmProcessor:
             self.log("✅ Segmentación por tiles completada")
             
             if progress_callback:
-                progress_callback(60, "Segmentación completada, iniciando conteo...")
+                progress_callback(60)
             
             # 2. BUSCAR MÁSCARA GENERADA
-            # El script process_with_tiles.py genera 'segmentacion_batch.tif'
             mask_path = os.path.join(output_dir, "segmentacion_batch.tif")
             
-            # Si no existe, buscar la máscara regular
             if not os.path.exists(mask_path):
                 mask_path = os.path.join(output_dir, f"{base_name}_balanced_argmax.tif")
             
@@ -353,7 +605,7 @@ class PalmProcessor:
             
             self.log(f"✓ Máscara encontrada: {mask_path}")
             
-            # 3. INSTANCIAS POR TILES (instancias_tiles.py)
+            # 3. INSTANCIAS POR TILES
             self.log("🔍 Ejecutando conteo de instancias por tiles...")
             
             inst_tiles_script = self.config["scripts"]["instancias_tiles"]
@@ -361,84 +613,57 @@ class PalmProcessor:
             if not os.path.exists(inst_tiles_script):
                 raise FileNotFoundError(f"Script de instancias por tiles no encontrado: {inst_tiles_script}")
             
-            # Obtener parámetros de instancias por tiles
             inst_tiles_params = self.config["parameters"]["instancias_tiles"]
             
-            # Construir comando para instancias_tiles.py
-            # NOTA: instancias_tiles.py espera argumentos posicionales: imagen máscara [opciones]
             cmd_inst = [
                 sys.executable,
                 inst_tiles_script,
                 image_path,
-                mask_path
+                mask_path,
+                "--window_radius", str(inst_tiles_params.get("window_radius", 350)),
+                "--output_dir", output_dir,
+                "--model_path", "models/model_converted.onnx"
             ]
             
-            # Agregar parámetros adicionales si existen en el script
-            # (Basado en tu script, parece que acepta --target_memory_mb)
-            if "target_memory_mb" in inst_tiles_params:
-                cmd_inst.extend(["--target_memory_mb", str(inst_tiles_params["target_memory_mb"])])
-            
-            if "window_radius" in inst_tiles_params:
-                cmd_inst.extend(["--window_radius", str(inst_tiles_params["window_radius"])])
-            
-            # Especificar directorio de salida si el script lo soporta
-            cmd_inst.extend(["--output_dir", output_dir])
-            
-            # Agregar ruta del modelo si es necesario
-            cmd_inst.extend(["--model_path", "models/model_converted.onnx"])
-            
             self.log(f"📊 Parámetros instancias por tiles:")
-            self.log(f"   • Window radius: {inst_tiles_params.get('window_radius', 350)}")
-            if "target_memory_mb" in inst_tiles_params:
-                self.log(f"   • Memoria objetivo: {inst_tiles_params['target_memory_mb']} MB")
+            self.log(f"    • Window radius: {inst_tiles_params.get('window_radius', 350)}")
             
             if progress_callback:
-                progress_callback(80, "Conteo de instancias en progreso...")
+                progress_callback(80)
             
-            returncode_inst = run_command_with_terminal_output(cmd_inst, cwd=project_dir)
+            returncode_inst = run_command_with_terminal_output(
+                cmd_inst,
+                cwd=project_dir,
+                progress_callback=progress_callback,
+                progress_range=(65, 95)
+            )
             
             if returncode_inst != 0:
                 raise Exception(f"Error en conteo por tiles (código {returncode_inst})")
             
             self.log("✅ Conteo por tiles completado")
             
-            # 4. LEER ESTADÍSTICAS
+            # 4. LEER ESTADÍSTICAS CON LA NUEVA FUNCIÓN ROBUSTA
             if progress_callback:
-                progress_callback(95, "Generando resultados finales...")
+                progress_callback(95)
             
-            # Buscar archivo CSV generado por instancias_tiles.py
-            csv_path = os.path.join(output_dir, f"{base_name}_predicted_atributos.csv")
-            
-            if os.path.exists(csv_path):
-                import pandas as pd
-                df = pd.read_csv(csv_path)
-                
-                mau_count = len(df[df['ESPECIE'] == 'Mauritia flexuosa'])
-                eut_count = len(df[df['ESPECIE'] == 'Euterpe precatoria'])
-                oeno_count = len(df[df['ESPECIE'] == 'Oenocarpus bataua'])
-                total_count = mau_count + eut_count + oeno_count
-                
-                stats = f"Total: {total_count} palmeras (Mauritia: {mau_count}, Euterpe: {eut_count}, Oenocarpus: {oeno_count})"
-            else:
-                # Intentar leer de otro archivo si existe
-                stats = self._read_final_statistics(base_name, output_dir)
+            stats = self._read_final_statistics(base_name, output_dir)
             
             if progress_callback:
-                progress_callback(100, "✅ Procesamiento optimizado completado")
+                progress_callback(100)
             
             self.log("=" * 70)
-            self.log("🎉 MODO OPTIMIZADO COMPLETADO EXITOSAMENTE")
+            self.log("🎉 MODO 128 COMPLETADO EXITOSAMENTE")
             self.log(f"📊 {stats}")
             self.log("=" * 70)
             
-            return f"Modo optimizado completado. {stats}"
+            return f"Modo 128 completado. {stats}"
             
         except Exception as e:
-            self.log(f"❌ Error en modo optimizado con tiles avanzados: {e}")
+            self.log(f"❌ Error en modo 128 con tiles avanzados: {e}")
             import traceback
             self.log(f"📋 Traceback: {traceback.format_exc()}")
             
-            # Fallback a modo normal de tiles
             try:
                 self.log("🔄 Intentando fallback a modo normal de tiles...")
                 return self._process_with_scripts_forced_tiles(image_path, progress_callback)
@@ -447,14 +672,12 @@ class PalmProcessor:
                 raise
 
     # ===================================================================
-    # MÉTODO PRINCIPAL MEJORADO - CON MODO OPTIMIZADO CON TILES
+    # MÉTODO PRINCIPAL
     # ===================================================================
 
-    def process_image(self, image_path: str, force_tiling: bool = False, 
-                     use_optimized_tiles: bool = False, progress_callback=None) -> str:
-        """
-        Ejecutar el pipeline completo - VERSIÓN MEJORADA
-        """
+    def process_image(self, image_path: str, force_tiling: bool = False,
+                      use_optimized_tiles: bool = False, progress_callback=None) -> str:
+        """Ejecutar el pipeline completo - VERSIÓN MEJORADA"""
         try:
             self.log(f"INICIANDO PROCESAMIENTO: {os.path.basename(image_path)}")
             
@@ -462,33 +685,29 @@ class PalmProcessor:
                 raise FileNotFoundError(f"La imagen no existe: {image_path}")
 
             if progress_callback:
-                progress_callback(1, "Iniciando procesamiento...")
+                progress_callback(1)
             
-            # NUEVO: Modo optimizado CON TILES AVANZADOS
             if use_optimized_tiles:
-                self.log("🎯 MODO OPTIMIZADO ACTIVADO - Usando scripts de tiles avanzados")
+                self.log("🎯 MODO 128 ACTIVADO - Usando scripts de tiles avanzados")
                 return self._process_with_advanced_tiles(image_path, progress_callback)
             
-            # CORRECCIÓN CRÍTICA: Verificar modo baja memoria SOLO si NO es optimizado
             low_ram_mode = self.config.get("optimization", {}).get("memory_management", {}).get("low_ram_mode", False)
             
             if progress_callback:
-                progress_callback(3, "Verificando modo de memoria...")
+                progress_callback(3)
             
             if low_ram_mode or force_tiling:
                 self.log("🔋 MODO BAJA MEMORIA DETECTADO - Usando scripts originales")
                 return self._process_with_scripts_forced_tiles(image_path, progress_callback)
 
-            # Análisis preciso de memoria para decidir estrategia (solo si no es optimizado ni baja memoria)
             if progress_callback:
-                progress_callback(5, "Analizando memoria...")
+                progress_callback(5)
             
             memory_analysis = self._analyze_memory_requirements_precise(image_path)
             
             if progress_callback:
-                progress_callback(8, "Memoria analizada, iniciando procesamiento...")
+                progress_callback(8)
             
-            # Decisión basada en análisis preciso
             if memory_analysis['requires_tiling']:
                 self.log("🧱 ACTIVANDO PROCESAMIENTO POR TILES OPTIMIZADO")
                 return self._process_with_optimized_tiles(image_path, memory_analysis, progress_callback)
@@ -505,13 +724,10 @@ class PalmProcessor:
     # ===================================================================
 
     def analyze_memory_requirements(self, image_path: str) -> dict:
-        """
-        Solo analiza los requisitos de memoria sin procesar la imagen
-        """
+        """Solo analiza los requisitos de memoria sin procesar la imagen"""
         try:
             self.log("🔍 Realizando análisis de requisitos de memoria...")
             
-            # Usar el análisis preciso existente
             analysis = self._analyze_memory_requirements_precise(image_path)
             
             if 'error' in analysis:
@@ -544,11 +760,8 @@ class PalmProcessor:
             }
 
     def _analyze_memory_requirements_precise(self, image_path: str) -> dict:
-        """
-        Analisis PRECISO de memoria usando el memory_optimizer
-        """
+        """Analisis PRECISO de memoria usando el memory_optimizer"""
         try:
-            # CORRECCIÓN CRÍTICA: Si está en modo baja memoria, FORZAR tiles
             if self.config.get("optimization", {}).get("memory_management", {}).get("low_ram_mode", False):
                 self.log("MODO BAJA MEMORIA DETECTADO - Forzando uso de tiles")
                 return {
@@ -566,7 +779,6 @@ class PalmProcessor:
                 self.log(f"Error en análisis de memoria: {analysis['error']}")
                 return {'requires_tiling': True, 'reason': 'Error en análisis'}
             
-            # Información de la imagen
             image_info = analysis['image_info']
             system_info = analysis['system_info']
             
@@ -574,11 +786,11 @@ class PalmProcessor:
             optimal_tile_size = analysis['optimal_tile_size'] or (512, 512)
             
             self.log(f"ANALISIS PRECISO COMPLETADO:")
-            self.log(f"   • Imagen: {image_info['memory_mb']:.1f} MB")
-            self.log(f"   • Memoria disponible: {system_info['available_memory_mb']:.1f} MB")
-            self.log(f"   • Tile óptimo: {optimal_tile_size}")
-            self.log(f"   • Usar tiles: {requires_tiling}")
-            self.log(f"   • Razón: {analysis['recommendation']}")
+            self.log(f"    • Imagen: {image_info['memory_mb']:.1f} MB")
+            self.log(f"    • Memoria disponible: {system_info['available_memory_mb']:.1f} MB")
+            self.log(f"    • Tile óptimo: {optimal_tile_size}")
+            self.log(f"    • Usar tiles: {requires_tiling}")
+            self.log(f"    • Razón: {analysis['recommendation']}")
             
             return {
                 'requires_tiling': requires_tiling,
@@ -594,29 +806,26 @@ class PalmProcessor:
             return {'requires_tiling': True, 'reason': f'Error: {str(e)}'}
 
     def _process_with_optimized_tiles(self, image_path: str, memory_analysis: dict, progress_callback=None) -> str:
-        """
-        Procesamiento usando el sistema de tiles eficiente
-        """
+        """Procesamiento usando el sistema de tiles eficiente"""
         try:
             base_name = os.path.basename(image_path).split('.')[0]
             output_dir = self.config["output"]["directory"]
             
             self.log(f"INICIANDO PROCESAMIENTO POR TILES OPTIMIZADO")
-            self.log(f"   • Tile size: {memory_analysis['optimal_tile_size']}")
-            self.log(f"   • Memoria/tile: {memory_analysis['tile_memory_mb']:.1f} MB")
+            self.log(f"    • Tile size: {memory_analysis['optimal_tile_size']}")
+            self.log(f"    • Memoria/tile: {memory_analysis['tile_memory_mb']:.1f} MB")
             
             if progress_callback:
-                progress_callback(10, "Configurando procesamiento por tiles...")
+                progress_callback(10)
             
-            # 1. SEGMENTACIÓN POR TILES
             seg_output_path = os.path.join(output_dir, f"{base_name}_balanced_argmax.tif")
             
             if progress_callback:
-                progress_callback(15, "Preparando segmentación por tiles...")
+                progress_callback(15)
             
             seg_success = self._run_segmentation_with_tiles(
-                image_path, 
-                seg_output_path, 
+                image_path,
+                seg_output_path,
                 memory_analysis['optimal_tile_size'],
                 progress_callback
             )
@@ -625,25 +834,22 @@ class PalmProcessor:
                 return "Error en segmentación por tiles"
             
             if progress_callback:
-                progress_callback(60, "Segmentación completada, iniciando conteo...")
+                progress_callback(60)
             
-            # 2. CONVERSIÓN A PNG (necesario para el script de instancias)
             if progress_callback:
-                progress_callback(65, "Convirtiendo resultados a PNG...")
+                progress_callback(65)
             
             png_output_path = os.path.join(output_dir, f"{base_name}_balanced_argmax.png")
             self._convert_tiff_to_png(seg_output_path, png_output_path)
             
-            # 3. EJECUTAR SCRIPT DE INSTANCIAS (usa la segmentación generada)
             if progress_callback:
-                progress_callback(70, "Ejecutando conteo de instancias...")
+                progress_callback(70)
             
             inst_result = self.run_instances(image_path)
             
             if progress_callback:
-                progress_callback(95, "Finalizando procesamiento...")
+                progress_callback(95)
             
-            # 4. GENERAR REPORTE FINAL
             stats = self._read_final_statistics(base_name, output_dir)
             
             self.log("PROCESAMIENTO POR TILES COMPLETADO EXITOSAMENTE")
@@ -654,49 +860,41 @@ class PalmProcessor:
             raise
 
     def _process_with_scripts_forced_tiles(self, image_path: str, progress_callback=None) -> str:
-        """
-        Procesamiento por tiles PERO usando los scripts originales para máxima compatibilidad
-        y mínimo uso de memoria - MODO BAJA MEMORIA
-        """
+        """Procesamiento por tiles usando scripts originales - MODO BAJA MEMORIA"""
         try:
             self.log("MODO BAJA MEMORIA: Usando scripts originales forzados")
             
             if progress_callback:
-                progress_callback(5, "Iniciando modo baja memoria...")
+                progress_callback(5)
             
             base_name = os.path.basename(image_path).split('.')[0]
             output_dir = self.config["output"]["directory"]
             
-            # 1. SEGMENTACIÓN CON SCRIPTS ORIGINALES
             if progress_callback:
-                progress_callback(15, "Ejecutando segmentación...")
+                progress_callback(15)
             
             self.log("Ejecutando segmentación con scripts originales...")
             seg_result = self.run_segmentation(image_path)
             self.log("Segmentación completada")
             
-            # 2. CONVERSIÓN A PNG (si es necesario)
             if progress_callback:
-                progress_callback(50, "Preparando archivos intermedios...")
+                progress_callback(50)
             
             tiff_seg_path = os.path.join(output_dir, f"{base_name}_balanced_argmax.tif")
             png_seg_path = os.path.join(output_dir, f"{base_name}_balanced_argmax.png")
             
-            # Convertir TIFF a PNG si no existe
             if os.path.exists(tiff_seg_path) and not os.path.exists(png_seg_path):
                 self._convert_tiff_to_png(tiff_seg_path, png_seg_path)
             
-            # 3. INSTANCIAS CON SCRIPTS ORIGINALES
             if progress_callback:
-                progress_callback(70, "Ejecutando conteo de instancias...")
+                progress_callback(70)
             
             self.log("Ejecutando conteo de instancias con scripts originales...")
             inst_result = self.run_instances(image_path)
             self.log("Conteo de instancias completado")
             
-            # 4. GENERAR REPORTE FINAL
             if progress_callback:
-                progress_callback(95, "Generando reporte final...")
+                progress_callback(95)
             
             stats = self._read_final_statistics(base_name, output_dir)
             
@@ -707,23 +905,18 @@ class PalmProcessor:
             self.log(f"Error en modo baja memoria: {e}")
             raise
 
-    def _run_segmentation_with_tiles(self, image_path: str, output_path: str, 
+    def _run_segmentation_with_tiles(self, image_path: str, output_path: str,
                                    tile_size: tuple, progress_callback=None) -> bool:
-        """
-        Ejecuta la segmentación usando el sistema de tiles
-        """
+        """Ejecuta la segmentación usando el sistema de tiles"""
         try:
             def segmentation_callback(tile_data, tile_info):
-                """Callback para procesar cada tile"""
                 try:
-                    # Procesar el tile con el modelo
                     processed_tile = self.tile_processor.process_tile_with_model(tile_data)
                     
                     if processed_tile is not None:
                         self.log(f"Tile {tile_info['id']} procesado")
                     else:
                         self.log(f"Tile {tile_info['id']} retornó None")
-                        # Crear máscara vacía como fallback
                         height, width = tile_data.shape[:2]
                         processed_tile = np.zeros((height, width), dtype=np.float32)
                     
@@ -734,14 +927,11 @@ class PalmProcessor:
                     height, width = tile_data.shape[:2]
                     return np.zeros((height, width), dtype=np.float32)
             
-            # CONFIGURAR CALLBACK DE PROGRESO PARA TILES - MODIFICADO
             def tile_progress_callback(progress, message):
                 if progress_callback:
-                    # Mapear progreso de tiles al rango 20-60% con incrementos de 1%
                     mapped_progress = 20 + (progress * 0.4)
-                    progress_callback(int(mapped_progress), f"Segmentación: {message}")
+                    progress_callback(int(mapped_progress))
             
-            # Ejecutar procesamiento por tiles
             success = self.tile_processor.process_image_by_tiles(
                 image_path=image_path,
                 output_path=output_path,
@@ -759,9 +949,7 @@ class PalmProcessor:
             return False
 
     def _convert_tiff_to_png(self, tiff_path: str, png_path: str):
-        """
-        Convierte el TIFF de segmentación a PNG para visualización
-        """
+        """Convierte el TIFF de segmentación a PNG para visualización"""
         try:
             from osgeo import gdal
             import numpy as np
@@ -771,15 +959,12 @@ class PalmProcessor:
             if dataset:
                 seg_data = dataset.ReadAsArray()
                 
-                # Convertir a formato PNG (8-bit)
                 if seg_data.dtype == np.float32:
-                    # Normalizar y convertir a uint8
-                    seg_normalized = ((seg_data - seg_data.min()) / 
+                    seg_normalized = ((seg_data - seg_data.min()) /
                                     (seg_data.max() - seg_data.min() + 1e-8) * 255).astype(np.uint8)
                 else:
                     seg_normalized = seg_data.astype(np.uint8)
                 
-                # Crear imagen PIL y guardar
                 seg_image = Image.fromarray(seg_normalized)
                 seg_image.save(png_path)
                 
@@ -796,48 +981,27 @@ class PalmProcessor:
         self.log("Usando procesamiento directo para consistencia de resultados...")
         
         if progress_callback:
-            progress_callback(10, "Iniciando segmentación...")
+            progress_callback(10)
         
         self.log("Iniciando segmentacion...")
         seg_result = self.run_segmentation(image_path)
         self.log("Segmentacion completada")
         
         if progress_callback:
-            progress_callback(60, "Iniciando conteo de instancias...")
+            progress_callback(60)
         
         self.log("Iniciando conteo de instancias...")
         inst_result = self.run_instances(image_path)
         self.log("Conteo de instancias completado")
         
-        # Leer estadísticas reales
         base_name = os.path.basename(image_path).split('.')[0]
         output_dir = self.config["output"]["directory"]
         stats = self._read_final_statistics(base_name, output_dir)
         
         if progress_callback:
-            progress_callback(100, "Procesamiento completado")
+            progress_callback(100)
         
         return f"Procesamiento exitoso. {stats}"
-
-    def _read_final_statistics(self, base_name, output_dir):
-        """Leer estadísticas reales del archivo CSV generado"""
-        try:
-            csv_path = os.path.join(output_dir, f"{base_name}_predicted_atributos.csv")
-            if os.path.exists(csv_path):
-                import pandas as pd
-                df = pd.read_csv(csv_path)
-                
-                mau_count = len(df[df['ESPECIE'] == 'Mauritia flexuosa'])
-                eut_count = len(df[df['ESPECIE'] == 'Euterpe precatoria'])
-                oeno_count = len(df[df['ESPECIE'] == 'Oenocarpus bataua'])
-                total_count = mau_count + eut_count + oeno_count
-                
-                return f"Total: {total_count} palmeras (Mauritia: {mau_count}, Euterpe: {eut_count}, Oenocarpus: {oeno_count})"
-            else:
-                return "Archivo de estadísticas no generado"
-        except Exception as e:
-            self.log(f"Error leyendo estadísticas: {e}")
-            return "Error leyendo estadísticas"
 
     def run_segmentation(self, image_path):
         """Ejecutar script de segmentación mostrando output en terminal"""
@@ -846,13 +1010,11 @@ class PalmProcessor:
         if not os.path.exists(seg_script):
             raise FileNotFoundError(f"Script no encontrado: {seg_script}")
             
-        # Obtener parámetros específicos de segmentación
         seg_params = self.config["parameters"]["segmentacion"]
         window_radius = seg_params["window_radius"]
         internal_window_radius = seg_params.get("internal_window_radius", int(round(window_radius * 0.75)))
         scaling = seg_params.get("scaling", "normalize")
         
-        # Construir comando
         cmd = [
             sys.executable,
             seg_script,
@@ -866,7 +1028,6 @@ class PalmProcessor:
         if "internal_window_radius" in seg_params:
             cmd.extend(["--internal_window_radius", str(internal_window_radius)])
         
-        # Ejecutar con output en terminal
         project_dir = os.path.dirname(os.path.dirname(__file__)) if "__file__" in locals() else os.getcwd()
         
         self.log(f"\n{'='*60}")
@@ -887,11 +1048,9 @@ class PalmProcessor:
         if not os.path.exists(inst_script):
             raise FileNotFoundError(f"Script no encontrado: {inst_script}")
         
-        # Obtener parámetros
         inst_params = self.config["parameters"]["instancias"]
         window_radius = inst_params["window_radius"]
         
-        # Obtener máscara de segmentación
         base_name = os.path.basename(image_path).split('.')[0]
         mask_path = os.path.join(self.config["output"]["directory"], f"{base_name}_balanced_argmax.tif")
         

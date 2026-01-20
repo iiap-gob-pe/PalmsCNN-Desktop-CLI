@@ -240,22 +240,37 @@ class ProcessingThread(QThread):
             self.update_signal.emit("Iniciando análisis de memoria...")
             self.progress_signal.emit(1)
             
+            # --- DEFINIR LA FUNCIÓN CALLBACK ---
+            # Esta función será llamada por processor.py cada vez que lea [PROGRESS]
+            def progress_callback(value):
+                # Validar que sea entero
+                try:
+                    val = int(value)
+                    self.progress_signal.emit(val)
+                except:
+                    pass
+            # -----------------------------------
+
             if self.processing_mode == 'low_memory':
                 self.processor.config["optimization"]["memory_management"]["low_ram_mode"] = True
                 self.update_signal.emit("MODO BAJA MEMORIA - Configurando procesador...")
             
             if self.use_optimized_tiles:
                 self.update_signal.emit("Usando procesamiento optimizado con cálculo preciso de memoria...")
+                # PASAMOS EL CALLBACK AQUÍ
                 result = self.processor.process_image(
                     self.image_path, 
                     force_tiling=self.force_tiling,
-                    use_optimized_tiles=True
+                    use_optimized_tiles=True,
+                    progress_callback=progress_callback  # <--- ¡CONECTADO!
                 )
             else:
                 self.update_signal.emit("Ejecutando procesamiento estándar...")
+                # PASAMOS EL CALLBACK AQUÍ TAMBIÉN
                 result = self.processor.process_image(
                     self.image_path, 
-                    force_tiling=self.force_tiling
+                    force_tiling=self.force_tiling,
+                    progress_callback=progress_callback  # <--- ¡CONECTADO!
                 )
             
             self.progress_signal.emit(100)
@@ -375,6 +390,13 @@ class MainWindow(QMainWindow):
                 f"   Progreso: {self.current_progress}%\n"
             )
             
+            # --- NUEVO: Actualizar el panel derecho SIEMPRE ---
+            # Esto hará que el texto coincida exactamente con la barra verde
+            if hasattr(self, 'lbl_performance_details'):
+                self.lbl_performance_details.setText(performance_info)
+            # --------------------------------------------------
+
+            # El log se mantiene igual (solo hitos importantes para no saturar)
             if (self.current_progress % 10 == 0 or 
                 status['elapsed_time_seconds'] % 30 < 2):
                 self.log(performance_info)
@@ -392,6 +414,13 @@ class MainWindow(QMainWindow):
         self.current_progress = 0
         self.peak_memory_observed = 0.0 # Resetear pico al iniciar
         self.performance_monitor.start_monitoring()
+        
+        # --- NUEVO: Activar panel lateral inmediatamente ---
+        self.stats_panel.setVisible(True)
+        self.scroll_details.setVisible(True)
+        self.lbl_performance_details.setVisible(True)
+        self.lbl_performance_details.setText("Iniciando monitor de recursos...")
+        # ---------------------------------------------------
         
         mode_info = self.get_processing_mode_info(processing_mode)
         self.log("=" * 60)
@@ -424,18 +453,33 @@ class MainWindow(QMainWindow):
         return modes.get(mode, modes['auto'])
 
     def update_progress_with_eta(self, value):
-        # MODIFICACIÓN: Actualizar en cada porcentaje, no solo en hitos
+        # 1. Guardar el valor oficial
         self.current_progress = value
-        self.progress_bar.setValue(value)
-        self.progress_label.setText(f"{value}%")
         
-        # Mantener los logs en hitos importantes
-        milestones = [1, 10, 25, 50, 75, 90, 95, 100]
+        # 2. Actualizar la barra visual (LA VERDAD VISUAL)
+        self.progress_bar.setValue(value)
+        
+        # --- NUEVO: ACTUALIZAR CHECKBOXES SEGÚN PROGRESO ---
+        if value >= 60:
+            self.chk_seg.setChecked(True)
+            self.chk_seg.setStyleSheet("QCheckBox { color: green; font-weight: bold; }")
+            
+        if value >= 95:
+            self.chk_inst.setChecked(True)
+            self.chk_inst.setStyleSheet("QCheckBox { color: green; font-weight: bold; }")
+        # ---------------------------------------------------
+        
+        # 3. Actualizar el log SOLO si es un hito importante, 
+        # PERO USANDO EL MISMO VALOR 'value' QUE LA BARRA
+        milestones = [1, 10, 25, 50, 75, 80, 90, 95, 100] # Añadí 80 a la lista
+        
         if value in milestones:
+            # Obtener datos de tiempo
             current_status = self.performance_monitor.get_current_status()
             eta = self.performance_monitor.calculate_eta(value, current_status['elapsed_time_seconds'])
             
-            self.log(f"PROGRESO: {value}% completado")
+            # IMPRIMIR EN EL LOG EL MISMO VALOR EXACTO
+            self.log(f"PROGRESO: {value}% completado") # <--- AQUÍ ESTÁ LA CLAVE
             self.log(f"   Tiempo transcurrido: {current_status['elapsed_time_formatted']}")
             self.log(f"   ETA: {eta}")
             self.log(f"   RAM usada: {current_status['memory_used_mb']:.1f} MB")
@@ -556,6 +600,16 @@ class MainWindow(QMainWindow):
                 
                 # Configurar processor para usar tiles optimizados
                 self.processor.config["optimization"]["memory_management"]["low_ram_mode"] = False
+                
+                # --- NUEVO: REINICIAR INDICADORES ---
+                self.chk_seg.setChecked(False)
+                self.chk_inst.setChecked(False)
+                self.chk_done.setChecked(False)
+                
+                # Mostrar advertencia
+                self.lbl_warning.setVisible(True)
+                # ------------------------------------
+                
                 self.start_performance_tracking(processing_mode, image_info)
                 
                 output_dir = self.processor.config["output"]["directory"]
@@ -571,7 +625,7 @@ class MainWindow(QMainWindow):
                 self.progress_bar.setVisible(True)
                 self.progress_bar.setRange(1, 100)
                 self.progress_bar.setValue(1)
-                self.progress_label.setText("1%")
+                # self.progress_label.setText("1%")  <--- BORRAR ESTA LÍNEA
                 
                 # Crear thread para procesamiento optimizado
                 self.thread = ProcessingThread(
@@ -605,6 +659,15 @@ class MainWindow(QMainWindow):
                     if strategy.get('optimal_tile_size'):
                         self.log(f"🧱 Tile óptimo: {strategy['optimal_tile_size']}")
             
+            # --- NUEVO: REINICIAR INDICADORES ---
+            self.chk_seg.setChecked(False)
+            self.chk_inst.setChecked(False)
+            self.chk_done.setChecked(False)
+            
+            # Mostrar advertencia
+            self.lbl_warning.setVisible(True)
+            # ------------------------------------
+            
             self.start_performance_tracking(processing_mode, image_info)
             
             output_dir = self.processor.config["output"]["directory"]
@@ -620,7 +683,7 @@ class MainWindow(QMainWindow):
             self.progress_bar.setVisible(True)
             self.progress_bar.setRange(1, 100)
             self.progress_bar.setValue(1)
-            self.progress_label.setText("1%")
+            # self.progress_label.setText("1%")  <--- BORRAR ESTA LÍNEA
             
             # Determinar si usar tiles optimizados (solo para modo optimizado)
             use_optimized_tiles = (processing_mode == 'optimized')
@@ -647,10 +710,26 @@ class MainWindow(QMainWindow):
         self.force_windows_memory_clean()
         
         self.progress_bar.setVisible(False)
-        self.progress_label.setText("")
+        # self.progress_label.setText("")  <--- BORRAR ESTA LÍNEA
         self.process_btn.setEnabled(True)
         
         self.processor.config["optimization"]["memory_management"]["low_ram_mode"] = False
+        
+        # --- NUEVO: ACTUALIZAR ESTADO FINAL ---
+        self.lbl_warning.setVisible(False) # Ocultar advertencia
+        
+        if success:
+            self.chk_seg.setChecked(True)
+            self.chk_inst.setChecked(True)
+            self.chk_done.setChecked(True)
+            # Ponerlos en verde
+            self.chk_seg.setStyleSheet("QCheckBox { color: green; font-weight: bold; }")
+            self.chk_inst.setStyleSheet("QCheckBox { color: green; font-weight: bold; }")
+            self.chk_done.setStyleSheet("QCheckBox { color: green; font-weight: bold; }")
+        else:
+            self.lbl_warning.setText("❌ PROCESO FALLIDO")
+            self.lbl_warning.setVisible(True)
+        # --------------------------------------
         
         self.show_final_performance_report(success, processing_mode, image_info)
         
@@ -662,10 +741,12 @@ class MainWindow(QMainWindow):
                 base_name = os.path.basename(self.current_image).split('.')[0]
                 output_dir = self.processor.config["output"]["directory"]
                 
-                # Buscar archivo de atributos (puede tener diferentes nombres)
+                # === BLOQUE CORREGIDO (solo esta parte se modifica) ===
+                # Buscar archivo de estadísticas con todos los nombres posibles
                 posibles_csv = [
-                    f"{base_name}_predicted_atributos.csv",
-                    f"atributos_{base_name}.csv",
+                    f"{base_name}_predicted_summary.csv",     # NUEVO: resumen directo (prioridad alta)
+                    f"{base_name}_atributos.csv",             # NUEVO: lista detallada (modo tiles)
+                    f"{base_name}_predicted_atributos.csv",   # Antiguo (otros modos)
                     "resultados_atributos.csv"
                 ]
                 
@@ -674,26 +755,54 @@ class MainWindow(QMainWindow):
                     csv_path = os.path.join(output_dir, csv_file)
                     if os.path.exists(csv_path):
                         csv_encontrado = csv_path
+                        self.log(f"📊 CSV encontrado: {csv_file}")
                         break
-                
+
                 if csv_encontrado:
                     try:
                         import pandas as pd
                         df = pd.read_csv(csv_encontrado)
+                        self.log(f"   Columnas del CSV: {list(df.columns)}")
+
+                        # Caso 1: CSV de resumen (tiene columna 'CONTEO')
+                        if 'CONTEO' in [c.upper() for c in df.columns]:
+                            self.log("   Tipo: Resumen directo")
+                            df.columns = [c.strip().upper() for c in df.columns]
+                            
+                            mau = int(df.loc[df['ESPECIE'].str.contains('MAURITIA', case=False, na=False), 'CONTEO'].iloc[0]) if not df[df['ESPECIE'].str.contains('MAURITIA', case=False)].empty else 0
+                            eut = int(df.loc[df['ESPECIE'].str.contains('EUTERPE', case=False, na=False), 'CONTEO'].iloc[0]) if not df[df['ESPECIE'].str.contains('EUTERPE', case=False)].empty else 0
+                            oeno = int(df.loc[df['ESPECIE'].str.contains('OENOCARPUS', case=False, na=False), 'CONTEO'].iloc[0]) if not df[df['ESPECIE'].str.contains('OENOCARPUS', case=False)].empty else 0
+                            
+                            total_row = df[df['ESPECIE'].str.contains('TOTAL', case=False, na=False)]
+                            total = int(total_row['CONTEO'].iloc[0]) if not total_row.empty else (mau + eut + oeno)
                         
-                        mau_count = len(df[df['ESPECIE'] == 'Mauritia flexuosa'])
-                        eut_count = len(df[df['ESPECIE'] == 'Euterpe precatoria'])
-                        oeno_count = len(df[df['ESPECIE'] == 'Oenocarpus bataua'])
-                        total_count = mau_count + eut_count + oeno_count
+                        # Caso 2: CSV de listado (una filra por palmera)
+                        else:
+                            self.log("   Tipo: Listado detallado")
+                            if 'ESPECIE' in df.columns:
+                                mau = len(df[df['ESPECIE'].str.contains('Mauritia flexuosa', case=False, na=False)])
+                                eut = len(df[df['ESPECIE'].str.contains('Euterpe precatoria', case=False, na=False)])
+                                oeno = len(df[df['ESPECIE'].str.contains('Oenocarpus bataua', case=False, na=False)])
+                                total = len(df)
+                            else:
+                                self.log("   No se encontró columna ESPECIE")
+                                mau = eut = oeno = total = len(df)
+
+                        # Actualizar el panel de estadísticas
+                        stats_text = (
+                            f"Mauritia flexuosa: {mau}\n"
+                            f"Euterpe precatoria: {eut}\n"
+                            f"Oenocarpus bataua: {oeno}"
+                        )
+                        self.update_statistics_panel(stats_text)
                         
-                        self.update_statistics_panel(f"Mauritia flexuosa: {mau_count}\nEuterpe precatoria: {eut_count}\nOenocarpus bataua: {oeno_count}")
-                        
-                        self.log(f"Estadísticas actualizadas: Mauritia={mau_count}, Euterpe={eut_count}, Oenocarpus={oeno_count}")
-                        
+                        self.log(f"✅ Estadísticas mostradas: Total {total} palmeras")
+
                     except Exception as e:
-                        self.log(f"Error leyendo estadísticas: {e}")
+                        self.log(f"Error leyendo CSV: {e}")
                 else:
-                    self.log("⚠️ Archivo de estadísticas no encontrado")
+                    self.log("⚠️ No se encontró ningún archivo de estadísticas")
+                # === FIN DEL BLOQUE CORREGIDO ===
             
             self.view_selector.setCurrentIndex(2)
             self.change_view("Conteo de Instancias")
@@ -701,8 +810,8 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(1000, self.force_interface_refresh)
                     
             QMessageBox.information(self, "Éxito", 
-                                  f"Procesamiento completado.\n"
-                                  f"Ver resultados en el panel derecho y consola.")
+                                f"Procesamiento completado.\n"
+                                f"Ver resultados en el panel derecho y consola.")
         else:
             self.log(f"ERROR en procesamiento: {message}")
             self.status_label.setText("ERROR en procesamiento")
@@ -741,7 +850,9 @@ class MainWindow(QMainWindow):
                 files_to_check = {
                     "Segmentación": f"{base_name}_balanced_argmax.png",
                     "Conteo": f"{base_name}_predicted.png",
-                    "Atributos": f"{base_name}_predicted_atributos.csv"
+                    "Resumen CSV": f"{base_name}_predicted_summary.csv",  # NUEVO
+                    "Atributos CSV": f"{base_name}_atributos.csv",        # NUEVO
+                    "Atributos CSV (antiguo)": f"{base_name}_predicted_atributos.csv"
                 }
                 
                 for file_type, file_name in files_to_check.items():
@@ -751,8 +862,69 @@ class MainWindow(QMainWindow):
                     else:
                         self.log(f"{file_type}: {file_name} - NO ENCONTRADO")
                 
-                self.update_statistics_from_files()
+                # === BLOQUE CORREGIDO - Reemplaza self.update_statistics_from_files() ===
+                # Buscar archivo de estadísticas con todos los nombres posibles
+                posibles_csv = [
+                    f"{base_name}_predicted_summary.csv",     # NUEVO: resumen directo (prioridad alta)
+                    f"{base_name}_atributos.csv",             # NUEVO: lista detallada (modo tiles)
+                    f"{base_name}_predicted_atributos.csv",   # Antiguo (otros modos)
+                    "resultados_atributos.csv"
+                ]
                 
+                csv_encontrado = None
+                for csv_file in posibles_csv:
+                    csv_path = os.path.join(output_dir, csv_file)
+                    if os.path.exists(csv_path):
+                        csv_encontrado = csv_path
+                        self.log(f"📊 CSV encontrado: {csv_file}")
+                        break
+
+                if csv_encontrado:
+                    try:
+                        import pandas as pd
+                        df = pd.read_csv(csv_encontrado)
+                        self.log(f"   Columnas del CSV: {list(df.columns)}")
+
+                        # Caso 1: CSV de resumen (tiene columna 'CONTEO')
+                        if 'CONTEO' in [c.upper() for c in df.columns]:
+                            self.log("   Tipo: Resumen directo")
+                            df.columns = [c.strip().upper() for c in df.columns]
+                            
+                            mau = int(df.loc[df['ESPECIE'].str.contains('MAURITIA', case=False, na=False), 'CONTEO'].iloc[0]) if not df[df['ESPECIE'].str.contains('MAURITIA', case=False)].empty else 0
+                            eut = int(df.loc[df['ESPECIE'].str.contains('EUTERPE', case=False, na=False), 'CONTEO'].iloc[0]) if not df[df['ESPECIE'].str.contains('EUTERPE', case=False)].empty else 0
+                            oeno = int(df.loc[df['ESPECIE'].str.contains('OENOCARPUS', case=False, na=False), 'CONTEO'].iloc[0]) if not df[df['ESPECIE'].str.contains('OENOCARPUS', case=False)].empty else 0
+                            
+                            total_row = df[df['ESPECIE'].str.contains('TOTAL', case=False, na=False)]
+                            total = int(total_row['CONTEO'].iloc[0]) if not total_row.empty else (mau + eut + oeno)
+                        
+                        # Caso 2: CSV de listado (una fila por palmera)
+                        else:
+                            self.log("   Tipo: Listado detallado")
+                            if 'ESPECIE' in df.columns:
+                                mau = len(df[df['ESPECIE'].str.contains('Mauritia flexuosa', case=False, na=False)])
+                                eut = len(df[df['ESPECIE'].str.contains('Euterpe precatoria', case=False, na=False)])
+                                oeno = len(df[df['ESPECIE'].str.contains('Oenocarpus bataua', case=False, na=False)])
+                                total = len(df)
+                            else:
+                                self.log("   No se encontró columna ESPECIE")
+                                mau = eut = oeno = total = len(df)
+
+                        # Actualizar el panel de estadísticas
+                        stats_text = (
+                            f"Mauritia flexuosa: {mau}\n"
+                            f"Euterpe precatoria: {eut}\n"
+                            f"Oenocarpus bataua: {oeno}"
+                        )
+                        self.update_statistics_panel(stats_text)
+                        
+                        self.log(f"✅ Estadísticas actualizadas: Total {total} palmeras")
+
+                    except Exception as e:
+                        self.log(f"Error leyendo CSV: {e}")
+                else:
+                    self.log("⚠️ No se encontró ningún archivo de estadísticas")
+                # === FIN DEL BLOQUE CORREGIDO ===
+                    
         except Exception as e:
             self.log(f"Error en actualización de interfaz: {e}")
 
@@ -905,20 +1077,20 @@ class MainWindow(QMainWindow):
         self.btn_check_system.clicked.connect(self.show_system_analysis)
         self.btn_check_system.setStyleSheet("text-align: left; padding: 6px;")
         
-        self.btn_analyze_tiles = QPushButton("Analizar Procesamiento por Tiles")
-        self.btn_analyze_tiles.setToolTip("Plan óptimo de procesamiento para imágenes grandes")
-        self.btn_analyze_tiles.clicked.connect(self.analyze_tile_processing)
-        self.btn_analyze_tiles.setStyleSheet("text-align: left; padding: 6px;")
+        # self.btn_analyze_tiles = QPushButton("Analizar Procesamiento por Tiles")
+        # self.btn_analyze_tiles.setToolTip("Plan óptimo de procesamiento para imágenes grandes")
+        # self.btn_analyze_tiles.clicked.connect(self.analyze_tile_processing)
+        # self.btn_analyze_tiles.setStyleSheet("text-align: left; padding: 6px;")
         
-        self.btn_memory_analysis = QPushButton("Análisis Detallado de Memoria")
-        self.btn_memory_analysis.setToolTip("Análisis completo de requisitos de memoria")
-        self.btn_memory_analysis.clicked.connect(self.analyze_memory_requirements)
-        self.btn_memory_analysis.setStyleSheet("text-align: left; padding: 6px;")
+        # self.btn_memory_analysis = QPushButton("Análisis Detallado de Memoria")
+        # self.btn_memory_analysis.setToolTip("Análisis completo de requisitos de memoria")
+        # self.btn_memory_analysis.clicked.connect(self.analyze_memory_requirements)
+        # self.btn_memory_analysis.setStyleSheet("text-align: left; padding: 6px;")
         
         diag_layout.addWidget(self.btn_check_image)
         diag_layout.addWidget(self.btn_check_system)
-        diag_layout.addWidget(self.btn_analyze_tiles)
-        diag_layout.addWidget(self.btn_memory_analysis)
+        # diag_layout.addWidget(self.btn_analyze_tiles)
+        # diag_layout.addWidget(self.btn_memory_analysis)
         
         left_layout.addWidget(diag_group)
         
@@ -965,10 +1137,64 @@ class MainWindow(QMainWindow):
         """)
         process_layout.addWidget(self.progress_bar)
         
-        self.progress_label = QLabel("")
-        self.progress_label.setAlignment(Qt.AlignCenter)
-        self.progress_label.setStyleSheet("QLabel { color: #333; font-weight: bold; }")
-        process_layout.addWidget(self.progress_label)
+        # --- NUEVO: INDICADORES DE PROCESO ---
+        status_layout = QHBoxLayout()
+        
+        self.chk_seg = QCheckBox("Segmentación")
+        self.chk_inst = QCheckBox("Instancias")
+        self.chk_done = QCheckBox("Finalizado")
+        
+        # Estilo para que se vean bien pero el usuario no los toque
+        for chk in [self.chk_seg, self.chk_inst, self.chk_done]:
+            chk.setEnabled(False) # Deshabilitado para que el usuario no haga clic (se ven gris, pero se marcarán)
+            # Opcional: Truco para que se vean habilitados pero no clicables:
+            # chk.setAttribute(Qt.WA_TransparentForMouseEvents) 
+            # chk.setFocusPolicy(Qt.NoFocus)
+            
+            # Estilo personalizado para el check
+            chk.setStyleSheet("""
+                QCheckBox::indicator:checked {
+                    background-color: #4CAF50;
+                    border: 1px solid #4CAF50;
+                    border-radius: 3px;
+                }
+                QCheckBox { font-weight: bold; font-size: 11px; }
+            """)
+            status_layout.addWidget(chk)
+            
+        process_layout.addLayout(status_layout)
+        
+        # --- NUEVO: ETIQUETA DE ADVERTENCIA CORREGIDA ---
+        self.lbl_warning = QLabel("⚠️ POR FAVOR, NO CIERRE LA APLICACIÓN\nEl proceso se está ejecutando...")
+        self.lbl_warning.setAlignment(Qt.AlignCenter)
+        
+        # 1. Permitir que el texto se ajuste automáticamente si falta espacio horizontal
+        self.lbl_warning.setWordWrap(True) 
+        
+        # 2. Establecer una altura mínima para asegurar que quepan las dos líneas cómodamente
+        # 50 pixeles debería ser suficiente para el texto, el padding y el borde.
+        self.lbl_warning.setMinimumHeight(50) 
+        
+        self.lbl_warning.setStyleSheet("""
+            QLabel { 
+                color: #c62828; /* Un rojo un poco más oscuro para mejor contraste */
+                font-weight: bold; 
+                font-size: 12px; /* Aumenté un poco la fuente para que se lea mejor */
+                background-color: #ffebee;
+                border: 2px solid #ef9a9a; /* Borde un poco más grueso */
+                border-radius: 6px;
+                padding: 8px; /* Un poco más de espacio interno */
+                margin-top: 10px; /* Más separación de la barra de progreso y los checks */
+            }
+        """)
+        self.lbl_warning.setVisible(False) # Oculto al inicio
+        process_layout.addWidget(self.lbl_warning)
+        # ------------------------------------------------
+        
+        # self.progress_label = QLabel("")  <--- (RECORDATORIO: ESTO LO BORRASTE ANTES)
+        # self.progress_label.setAlignment(Qt.AlignCenter)
+        # self.progress_label.setStyleSheet("QLabel { color: #333; font-weight: bold; }")
+        # process_layout.addWidget(self.progress_label)
         
         left_layout.addWidget(process_group)
         
@@ -1490,6 +1716,72 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.log(f"Error actualizando estadísticas: {e}")
         
+    def _load_statistics_csv(self, base_name, output_dir):
+        """
+        Función auxiliar unificada para cargar estadísticas desde cualquier CSV generado
+        Prioriza: _predicted_summary.csv → _atributos.csv → _predicted_atributos.csv
+        """
+        posibles_csv = [
+            f"{base_name}_predicted_summary.csv",      # Resumen directo (modo optimizado)
+            f"{base_name}_atributos.csv",              # Lista detallada (modo tiles)
+            f"{base_name}_predicted_atributos.csv",    # Nombre antiguo (otros modos)
+            "resultados_atributos.csv"
+        ]
+
+        csv_encontrado = None
+        for csv_file in posibles_csv:
+            csv_path = os.path.join(output_dir, csv_file)
+            if os.path.exists(csv_path):
+                csv_encontrado = csv_path
+                self.log(f"📊 CSV encontrado: {csv_file}")
+                break
+
+        if not csv_encontrado:
+            self.log("⚠️ No se encontró ningún archivo de estadísticas")
+            return
+
+        try:
+            import pandas as pd
+            df = pd.read_csv(csv_encontrado)
+            self.log(f"   Columnas del CSV: {list(df.columns)}")
+
+            # Caso 1: CSV de resumen (tiene columna 'CONTEO')
+            if 'CONTEO' in [c.upper() for c in df.columns]:
+                self.log("   Tipo: Resumen directo")
+                df.columns = [c.strip().upper() for c in df.columns]
+                
+                mau = int(df.loc[df['ESPECIE'].str.contains('MAURITIA', case=False, na=False), 'CONTEO'].iloc[0]) if not df[df['ESPECIE'].str.contains('MAURITIA', case=False)].empty else 0
+                eut = int(df.loc[df['ESPECIE'].str.contains('EUTERPE', case=False, na=False), 'CONTEO'].iloc[0]) if not df[df['ESPECIE'].str.contains('EUTERPE', case=False)].empty else 0
+                oeno = int(df.loc[df['ESPECIE'].str.contains('OENOCARPUS', case=False, na=False), 'CONTEO'].iloc[0]) if not df[df['ESPECIE'].str.contains('OENOCARPUS', case=False)].empty else 0
+                
+                total_row = df[df['ESPECIE'].str.contains('TOTAL', case=False, na=False)]
+                total = int(total_row['CONTEO'].iloc[0]) if not total_row.empty else (mau + eut + oeno)
+            
+            # Caso 2: CSV de listado (una fila por palmera)
+            else:
+                self.log("   Tipo: Listado detallado")
+                if 'ESPECIE' in df.columns:
+                    mau = len(df[df['ESPECIE'].str.contains('Mauritia flexuosa', case=False, na=False)])
+                    eut = len(df[df['ESPECIE'].str.contains('Euterpe precatoria', case=False, na=False)])
+                    oeno = len(df[df['ESPECIE'].str.contains('Oenocarpus bataua', case=False, na=False)])
+                    total = len(df)
+                else:
+                    self.log("   No se encontró columna ESPECIE")
+                    mau = eut = oeno = total = len(df)
+
+            # Construir texto para el panel
+            stats_text = (
+                f"Mauritia flexuosa: {mau}\n"
+                f"Euterpe precatoria: {eut}\n"
+                f"Oenocarpus bataua: {oeno}"
+            )
+            
+            self.update_statistics_panel(stats_text)
+            self.log(f"✅ Estadísticas mostradas: Total {total} palmeras (Mauritia: {mau}, Euterpe: {eut}, Oenocarpus: {oeno})")
+
+        except Exception as e:
+            self.log(f"❌ Error leyendo CSV: {e}")    
+
     def change_view(self, view_name):
         if not self.current_image:
             return
@@ -1794,8 +2086,22 @@ class MainWindow(QMainWindow):
             self.log(f"ERROR en verificacion de permisos: {str(e)}")
 
     def closeEvent(self, event):
+        # --- NUEVO: VERIFICAR SI HAY UN PROCESO CORRIENDO ---
+        if hasattr(self, 'thread') and self.thread.isRunning():
+            warning = QMessageBox.warning(self, 'Proceso en Ejecución',
+                                        '⚠️ ¡CUIDADO!\n\n'
+                                        'Se está ejecutando un proceso de segmentación.\n'
+                                        'Si cierra la aplicación ahora, el proceso se interrumpirá y podría perder datos.\n\n'
+                                        '¿Realmente desea forzar el cierre?',
+                                        QMessageBox.Yes | QMessageBox.No,
+                                        QMessageBox.No)
+            if warning == QMessageBox.No:
+                event.ignore()
+                return
+        # ----------------------------------------------------
+
         reply = QMessageBox.question(self, 'Salir',
-                                     'Estas seguro de que quieres salir?',
+                                     '¿Estás seguro de que quieres salir?',
                                      QMessageBox.Yes | QMessageBox.No,
                                      QMessageBox.No)
 
